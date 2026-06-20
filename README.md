@@ -89,7 +89,7 @@ compute.
 │   │   ├── requirements.txt         # Launcher deps (anthropic[webhooks], powertools)
 │   │   └── shared/                  # Payload, rate limiter, MicroVM client, types
 │   ├── scripts/
-│   │   ├── build-image.sh           # Zip + upload + create-micro-vm-image
+│   │   ├── build-image.sh           # Zip + upload + create-microvm-image
 │   │   └── verify.py                # Operator-side: create a session to exercise the flow
 ├── docs/                            # Architecture diagram + notes
 ├── README.md  LICENSE  CONTRIBUTING.md  CODE_OF_CONDUCT.md
@@ -154,8 +154,8 @@ python src/scripts/verify.py --create
 ```
 
 This creates a session, triggers the webhook, launches a MicroVM, and runs the
-agent end-to-end. Confirm with `aws lambda-microvms list-micro-vms` /
-`get-micro-vm`.
+agent end-to-end. Confirm with `aws lambda-microvms list-microvms` /
+`get-microvm`.
 
 ## Configuration
 

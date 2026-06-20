@@ -464,7 +464,7 @@ Outputs:
     Description: S3 bucket for the MicroVM image source (app.zip).
     Value: !Ref ArtifactBucket
   BuildRoleArn:
-    Description: Build role ARN passed to create-micro-vm-image.
+    Description: Build role ARN passed to create-microvm-image.
     Value: !GetAtt BuildRole.Arn
   MicroVmExecutionRoleArn:
     Description: Execution role the MicroVM assumes to read the environment key.
