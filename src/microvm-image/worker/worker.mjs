@@ -115,9 +115,9 @@ const server = http.createServer(async (req, res) => {
       try {
         const raw = await readBody(req);
         const envelope = raw ? JSON.parse(raw) : {};
-        // The service wraps the payload: { microVmId, runPayload: "<JSON>" }
-        const inner = envelope.runPayload
-          ? JSON.parse(envelope.runPayload)
+        // The service wraps the payload: { microvmId, runHookPayload: "<JSON>" }.
+        const inner = envelope.runHookPayload
+          ? JSON.parse(envelope.runHookPayload)
           : envelope;
         const dispatch = inner.session || inner;
         if (!dispatch.ANTHROPIC_SESSION_ID) {
