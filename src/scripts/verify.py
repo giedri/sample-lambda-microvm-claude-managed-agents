@@ -8,8 +8,8 @@ launcher Lambda verifies the signature in-process and starts one MicroVM.
 
 You then confirm a MicroVM reached the RUNNING state with the AWS CLI:
 
-    aws lambda-microvms list-micro-vms --image-identifier <image>
-    aws lambda-microvms get-micro-vm --micro-vm-identifier <id>
+    aws lambda-microvms list-microvms --image-identifier <image>
+    aws lambda-microvms get-microvm --microvm-identifier <id>
 
 Credentials (operator scope only — never on the control plane):
 
@@ -55,8 +55,8 @@ def create_session(client, environment_id: str, agent_id: str) -> None:
     print(
         "If the webhook endpoint is registered, a session.status_run_started "
         "event will trigger a MicroVM launch. Confirm with:\n"
-        "  aws lambda-microvms list-micro-vms --image-identifier <image>\n"
-        "  aws lambda-microvms get-micro-vm --micro-vm-identifier <id>"
+        "  aws lambda-microvms list-microvms --image-identifier <image>\n"
+        "  aws lambda-microvms get-microvm --microvm-identifier <id>"
     )
 
 
