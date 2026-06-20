@@ -1,0 +1,477 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Claude Self-Hosted Sandboxes on AWS Lambda MicroVMs. Launches one isolated
+  MicroVM per session via an event-driven webhook control plane.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: claude-microvm-sandbox
+    AllowedPattern: "^[a-z0-9][a-z0-9-]{1,40}[a-z0-9]$"
+    Description: Lower-case name prefix for created resources (S3 + roles).
+
+  ImageNamePrefix:
+    Type: String
+    Default: claude-self-hosted-worker
+    AllowedPattern: "^[a-zA-Z0-9][a-zA-Z0-9-_]{0,62}$"
+    Description: MicroVM image name prefix; build logs go to /aws/lambda/microvms/<image-name>.
+
+  AnthropicEnvironmentId:
+    Type: String
+    Description: The Claude self_hosted environment id (env_...).
+
+  MicroVmImageIdentifier:
+    Type: String
+    Default: claude-self-hosted-worker
+    Description: Name of the built MicroVM image the launcher runs (resolved to a full ARN below).
+
+  AnthropicEnvironmentKey:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: >-
+      Optional. The Anthropic environment key (the self-hosted environment
+      credential generated in the Claude Console). If provided, the
+      stack populates the environment-key secret with it; if left blank, the
+      secret is created empty for out-of-band population. Convenient for
+      dev/test (keep the value in your local, gitignored samconfig.toml); for
+      production prefer leaving it blank and populating the secret separately.
+
+  WebhookSigningSecret:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: >-
+      Optional. The Anthropic webhook signing secret (whsec_...). Same semantics
+      as AnthropicEnvironmentKey: populated by the stack if provided, else left
+      empty for out-of-band population.
+
+Conditions:
+  HasEnvironmentKey: !Not [!Equals [!Ref AnthropicEnvironmentKey, ""]]
+  HasSigningSecret: !Not [!Equals [!Ref WebhookSigningSecret, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.14
+    Architectures: [arm64]
+    Timeout: 30
+    # Lambda CPU scales with memory. The launcher imports anthropic (+ pydantic,
+    # httpx) for webhook verification; at 128 MB the cold-start import alone can
+    # exceed the timeout. 1024 MB gives ~1 vCPU so cold init is a few seconds.
+    MemorySize: 1024
+
+Resources:
+  # --- Launcher Lambda + webhook API --------------------------------------
+  LauncherFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-launcher"
+      CodeUri: src/functions/
+      Handler: launcher.handler
+      Environment:
+        Variables:
+          ANTHROPIC_ENVIRONMENT_ID: !Ref AnthropicEnvironmentId
+          # RunMicroVm requires the full image ARN, not a bare name. Build it
+          # from the configured name + this account/region.
+          MICROVM_IMAGE_IDENTIFIER: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${MicroVmImageIdentifier}"
+          ENVIRONMENT_KEY_SECRET_ARN: !Ref EnvironmentKeySecret
+          MICROVM_EXECUTION_ROLE_ARN: !GetAtt MicroVmExecutionRole.Arn
+          # Webhook signature verification happens in-process (no API GW authorizer).
+          SIGNING_SECRET_ARN: !Ref SigningSecret
+          # DynamoDB table backing durable webhook dedupe (Powertools Idempotency,
+          # keyed on the webhook event id). Replaces the old per-instance in-memory
+          # set so retried/concurrent deliveries launch exactly one MicroVM.
+          IDEMPOTENCY_TABLE: !Ref IdempotencyTable
+      Policies:
+        # Read only the signing secret (SAM policy template, scoped to the ARN).
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref SigningSecret
+        # MicroVM-specific actions have no SAM policy template — explicit
+        # least-privilege statements (all confirmed against the deployed service):
+        - Statement:
+            # The IAM action is lambda:RunMicroVm even though the API operation
+            # is named RunMicrovm (confirmed by the service's 403).
+            - Effect: Allow
+              Action:
+                - "lambda:RunMicroVm"
+              Resource: "*"
+            # PassRole for the MicroVM execution role. No iam:PassedToService
+            # condition — the MicroVM service passes the role to a principal that
+            # isn't lambda.amazonaws.com, which that condition would deny.
+            - Effect: Allow
+              Action: "iam:PassRole"
+              Resource: !GetAtt MicroVmExecutionRole.Arn
+            # RunMicroVm attaches the AWS-managed network connectors; the caller
+            # must be allowed to pass them.
+            - Effect: Allow
+              Action: "lambda:PassNetworkConnector"
+              Resource:
+                - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:ALL_INGRESS"
+                - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:INTERNET_EGRESS"
+            # Durable idempotency store (Powertools Idempotency). Exactly the four
+            # item actions the utility needs — least-privilege, scoped to the table.
+            - Effect: Allow
+              Action:
+                - "dynamodb:GetItem"
+                - "dynamodb:PutItem"
+                - "dynamodb:UpdateItem"
+                - "dynamodb:DeleteItem"
+              Resource: !GetAtt IdempotencyTable.Arn
+      Events:
+        Webhook:
+          Type: Api
+          Properties:
+            RestApiId: !Ref WebhookApi
+            Path: /webhook
+            Method: POST
+            # Edge request validation: reject malformed bodies before invoking
+            # the launcher. This is request HYGIENE, not authentication — anyone
+            # can send a schema-valid body, so the launcher still HMAC-verifies
+            # the raw body. ValidateBody only inspects (does not alter) the body,
+            # so the raw-bytes signature stays intact. Validates STRUCTURE only,
+            # not data.type values (see the Models note on WebhookApi).
+            RequestModel:
+              Model: AnthropicWebhookEvent
+              Required: true
+              ValidateBody: true
+              ValidateParameters: false
+
+  # Explicit API so we control the name and stage. AuthorizationType is NONE:
+  # the launcher verifies the webhook signature in-process (a REQUEST authorizer
+  # never receives the body needed to verify the HMAC).
+  WebhookApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${ProjectName}-webhook-api"
+      StageName: prod
+      EndpointConfiguration:
+        Type: REGIONAL
+      TracingEnabled: true
+      Models:
+        AnthropicWebhookEvent:
+          $schema: "http://json-schema.org/draft-04/schema#"
+          type: object
+          required: [type, id, created_at, data]
+          properties:
+            type:
+              type: string
+            id:
+              type: string
+            created_at:
+              type: string
+            data:
+              type: object
+              required: [type, id]
+              properties:
+                type:
+                  type: string
+                id:
+                  type: string
+
+  # --- WAF (regional WebACL on the webhook REST API) ----------------------
+  # Defense-in-depth for the public webhook endpoint. Like request validation,
+  # this is NOT authentication — the launcher's HMAC signature check remains the
+  # only thing that proves a request is genuinely from Anthropic. WAF adds
+  # managed protections (OWASP/known-bad/IP-reputation) plus a per-IP rate limit
+  # so the endpoint can't be cheaply flooded. Scope must be REGIONAL (REST API).
+  WebhookWebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "${ProjectName}-webhook-web-acl"
+      Scope: REGIONAL
+      Description: !Sub "WAF WebACL for the ${ProjectName} webhook REST API"
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${ProjectName}-webhook-web-acl"
+      Rules:
+        # AWS managed Common Rule Set (OWASP: XSS, path traversal, LFI/RFI, etc.).
+        # BLOCK by default. Unlike a large-payload API, our webhook body is a tiny
+        # fixed envelope (already size-bounded by request validation), so we do
+        # NOT override SizeRestrictions_BODY to Count — an oversized body here is
+        # anomalous and should be blocked.
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${ProjectName}-webhook-common-rules"
+
+        # Known Bad Inputs — exploit signatures (host-header injection, JNDI/
+        # lookup payloads, malformed requests). No legitimate webhook matches, so
+        # BLOCK by default.
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${ProjectName}-webhook-bad-inputs"
+
+        # SQL injection signatures. The launcher has no SQL surface, so this is
+        # pure defense-in-depth on a public endpoint; BLOCK by default.
+        - Name: AWSManagedRulesSQLiRuleSet
+          Priority: 3
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesSQLiRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${ProjectName}-webhook-sqli"
+
+        # Amazon IP reputation list — blocks source IPs on AWS threat-intel
+        # lists. BLOCK by default.
+        - Name: AWSManagedRulesAmazonIpReputationList
+          Priority: 4
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${ProjectName}-webhook-ip-reputation"
+
+        # Per-IP rate limit on the webhook path. 100 requests / 5 min per IP is
+        # the WAFv2 minimum and far above this endpoint's real volume (the webhook
+        # fires roughly once per session start). BLOCK directly — it's our own
+        # threshold, not a managed-rule false-positive risk. The signature check
+        # still authenticates; this just caps flooding.
+        - Name: RateLimitWebhookPerIP
+          Priority: 5
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: 100
+              EvaluationWindowSec: 300
+              AggregateKeyType: IP
+              ScopeDownStatement:
+                ByteMatchStatement:
+                  SearchString: /webhook
+                  FieldToMatch:
+                    UriPath: {}
+                  PositionalConstraint: STARTS_WITH
+                  TextTransformations:
+                    - Priority: 0
+                      Type: NONE
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${ProjectName}-webhook-rate-limit"
+
+  # WAF logging to CloudWatch Logs. The log group name MUST start with
+  # "aws-waf-logs-" or WAFv2 rejects it as a logging destination.
+  WebhookWebACLLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "aws-waf-logs-${ProjectName}-webhook"
+      RetentionInDays: 30
+
+  WebhookWebACLLogging:
+    Type: AWS::WAFv2::LoggingConfiguration
+    Properties:
+      ResourceArn: !GetAtt WebhookWebACL.Arn
+      LogDestinationConfigs:
+        - !GetAtt WebhookWebACLLogGroup.Arn
+
+  # Associate the WebACL with the REST API's prod stage. WAFv2 associations are
+  # per-stage; we have only the prod stage, so this covers all API traffic.
+  # DependsOn the SAM-generated stage (WebhookApiprodStage) so the association
+  # never races stage creation on a fresh deploy. The !Sub ARN alone only
+  # depends on the RestApi.
+  WebhookWebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    DependsOn: WebhookApiprodStage
+    Properties:
+      ResourceArn: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}::/restapis/${WebhookApi}/stages/prod"
+      WebACLArn: !GetAtt WebhookWebACL.Arn
+
+  # --- Idempotency store ---------------------------------------------------
+  # Durable dedupe for webhook deliveries (Powertools Idempotency). Anthropic
+  # retries the same event id on ANY non-2xx (and ~20 consecutive failures
+  # auto-disable the endpoint), and deliveries can arrive concurrently — a
+  # per-instance in-memory set missed both, double-launching MicroVMs. This
+  # table makes "exactly one MicroVM per webhook event" durable across cold
+  # starts and concurrent instances.
+  #
+  # Powertools schema: partition key `id` (string), item TTL on `expiration`.
+  # PAY_PER_REQUEST suits the very low, bursty webhook volume (no capacity to
+  # plan). The data is transient dedup state, so the table is disposable with
+  # the stack (DeletionPolicy: Delete).
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub "${ProjectName}-idempotency"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiration
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # --- Secrets (populate out-of-band after deploy) ------------------------
+  EnvironmentKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}/anthropic-environment-key"
+      Description: Anthropic environment key (ANTHROPIC_ENVIRONMENT_KEY).
+      # Populated from the AnthropicEnvironmentKey parameter when provided;
+      # otherwise created empty for out-of-band population.
+      SecretString: !If [HasEnvironmentKey, !Ref AnthropicEnvironmentKey, !Ref "AWS::NoValue"]
+
+  SigningSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}/anthropic-webhook-signing-secret"
+      Description: Anthropic webhook signing secret (whsec_...).
+      SecretString: !If [HasSigningSecret, !Ref WebhookSigningSecret, !Ref "AWS::NoValue"]
+
+  # --- MicroVM execution role ---------------------------------------------
+  # Assumed by the MicroVM at run time. The in-VM worker uses this role to fetch
+  # the environment key from Secrets Manager — the key never transits the
+  # launcher or the launch configuration (only a secret reference does).
+  MicroVmExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-microvm-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+              - "sts:TagSession"
+      Policies:
+        - PolicyName: read-environment-key
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "secretsmanager:GetSecretValue"
+                Resource: !Ref EnvironmentKeySecret
+        - PolicyName: runtime-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/microvms/${ImageNamePrefix}*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/microvms/${ImageNamePrefix}*:*"
+
+  # --- MicroVM image build prerequisites ----------------------------------
+  # These support building the MicroVM image (a separate CLI step), not the
+  # launcher Lambda — SAM does not manage them, they are plain resources.
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${ProjectName}-artifacts-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-build-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+              - "sts:TagSession"
+      Policies:
+        - PolicyName: artifact-bucket-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+        - PolicyName: build-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/microvms/${ImageNamePrefix}*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/microvms/${ImageNamePrefix}*:*"
+
+Outputs:
+  WebhookUrl:
+    Description: Register this URL as the Anthropic webhook endpoint.
+    Value: !Sub "https://${WebhookApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/prod/webhook"
+  LauncherFunctionArn:
+    Description: The launcher Lambda function ARN.
+    Value: !GetAtt LauncherFunction.Arn
+  ArtifactBucketName:
+    Description: S3 bucket for the MicroVM image source (app.zip).
+    Value: !Ref ArtifactBucket
+  BuildRoleArn:
+    Description: Build role ARN passed to create-micro-vm-image.
+    Value: !GetAtt BuildRole.Arn
+  MicroVmExecutionRoleArn:
+    Description: Execution role the MicroVM assumes to read the environment key.
+    Value: !GetAtt MicroVmExecutionRole.Arn
+  EnvironmentKeySecretArn:
+    Description: Populate this secret with the Anthropic environment key.
+    Value: !Ref EnvironmentKeySecret
+  SigningSecretArn:
+    Description: Populate this secret with the Anthropic webhook signing secret.
+    Value: !Ref SigningSecret
