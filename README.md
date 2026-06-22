@@ -82,8 +82,7 @@ compute.
 ├── src/
 │   ├── microvm-image/               # Contents zipped into the MicroVM image
 │   │   ├── Dockerfile               # AL2023 + Node worker, /workspace, /mnt/session/outputs
-│   │   ├── worker/worker.mjs        # HTTP lifecycle-hook server (EnvironmentWorker)
-│   │   └── runtime-config.json      # Enables the /run (+ ready/validate/...) hooks
+│   │   └── worker/worker.mjs        # HTTP lifecycle-hook server (EnvironmentWorker)
 │   ├── functions/                   # Launcher Lambda (sam build packages this)
 │   │   ├── launcher.py              # Verifies webhook signature; RunMicrovm per session
 │   │   ├── requirements.txt         # Launcher deps (anthropic[webhooks], powertools)
