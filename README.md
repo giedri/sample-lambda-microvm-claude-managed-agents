@@ -85,8 +85,9 @@ compute.
 │   │   └── worker/worker.mjs        # HTTP lifecycle-hook server (EnvironmentWorker)
 │   ├── functions/                   # Launcher Lambda (sam build packages this)
 │   │   ├── launcher.py              # Verifies webhook signature; RunMicrovm per session
-│   │   ├── requirements.txt         # Launcher deps (anthropic[webhooks], powertools)
-│   │   └── shared/                  # Payload, rate limiter, MicroVM client, types
+│   │   ├── requirements.txt         # Launcher deps (anthropic[webhooks], powertools, bundled boto3/botocore)
+│   │   ├── shared/                  # Payload, rate limiter, MicroVM client, types
+│   │   └── wheels/                  # Vendored boto3/botocore wheels (lambda-microvms client)
 │   ├── scripts/
 │   │   ├── build-image.sh           # Zip + upload + create-microvm-image
 │   │   └── verify.py                # Operator-side: create a session to exercise the flow
