@@ -51,8 +51,8 @@ from shared.constants import (
     all_ingress_arn,
     internet_egress_arn,
 )
-from shared.microvm_client import LaunchMicroVmError, MicroVmClient, SignedMicroVmClient
-from shared.payload import build_launch_configuration
+from shared.microvm_client import Boto3MicroVmClient, LaunchMicroVmError, MicroVmClient
+from shared.payload import build_run_hook_payload
 from shared.rate_limiter import TokenBucket
 from shared.types import LauncherConfig, WebhookEvent
 
@@ -101,11 +101,11 @@ class Launcher:
 
     def _launch_and_dispatch(self, event: WebhookEvent) -> dict[str, Any]:
         """Launch one MicroVM with the run hook payload. Raises on failure."""
-        launch_configuration = build_launch_configuration(event, self._config)
+        run_hook_payload = build_run_hook_payload(event, self._config)
         self._rate_limiter.acquire()
         launched = self._client.launch_microvm(
             image_identifier=self._config.image_identifier,
-            run_hook_payload=launch_configuration,
+            run_hook_payload=run_hook_payload,
             max_lifetime_seconds=self._config.max_lifetime_seconds,
             execution_role_arn=self._config.execution_role_arn,
             idle_policy=DEFAULT_IDLE_POLICY,
@@ -155,11 +155,11 @@ class Launcher:
             logger.info("event id=%s already in progress; not re-launching", event.event_id)
             return {"statusCode": 200, "body": "in progress"}
         except LaunchMicroVmError as exc:
-            logger.error("LaunchMicroVM failed for session_id=%s: %s", event.session_id, exc)
+            logger.error("RunMicrovm failed for session_id=%s: %s", event.session_id, exc)
             return {
                 "statusCode": 502,
                 "body": json.dumps(
-                    {"error": "launch_microvm_failed", "session_id": event.session_id}
+                    {"error": "run_microvm_failed", "session_id": event.session_id}
                 ),
             }
 
@@ -254,7 +254,7 @@ def handler(
             logger.info("denying webhook: signature verification failed")
             return {"statusCode": 401, "body": "signature verification failed"}
 
-    client = SignedMicroVmClient(region_name=config.aws_region)
+    client = Boto3MicroVmClient(region_name=config.aws_region)
     launcher = Launcher(config, client)
 
     table_name = os.environ.get("IDEMPOTENCY_TABLE")

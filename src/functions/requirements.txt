@@ -1,16 +1,11 @@
-# Runtime dependencies bundled into the launcher Lambda deployment package.
-#
-# anthropic is required by launcher.py for webhook signature verification
-# (client.beta.webhooks.unwrap). The [webhooks] extra pulls in `standardwebhooks`,
-# which performs the actual HMAC verification — without it unwrap() raises
-# "You need to install anthropic[webhooks]".
-#
-# Pin a floor recent enough to expose client.beta.webhooks (older versions, e.g.
-# 0.99.0, have neither the resource nor the [webhooks] extra). Deploy installs
-# with --only-binary for the native pydantic_core wheel; anthropic itself is pure
-# Python. boto3/botocore are provided by the Lambda runtime and excluded here.
+# Webhook signature verification (client.beta.webhooks.unwrap); the [webhooks]
+# extra provides the HMAC verifier.
 anthropic[webhooks]>=0.69
 
-# AWS Lambda Powertools: structured Logger and Secrets Manager Parameters
-# (cached secret retrieval). Pure Python; boto3/botocore come from the runtime.
+# Structured Logger and cached Secrets Manager retrieval.
 aws-lambda-powertools>=3.0
+
+# Vendored boto3/botocore (lambda-microvms client). Referenced by file path so
+# pip installs exactly these wheels; botocore is listed first to satisfy boto3.
+src/functions/wheels/botocore-1.43.34-py3-none-any.whl
+src/functions/wheels/boto3-1.43.34-py3-none-any.whl
