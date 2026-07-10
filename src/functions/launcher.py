@@ -176,10 +176,10 @@ def _load_config() -> LauncherConfig:
     return LauncherConfig(
         environment_id=os.environ["ANTHROPIC_ENVIRONMENT_ID"],
         image_identifier=os.environ["MICROVM_IMAGE_IDENTIFIER"],
-        environment_key_secret_id=os.environ["ENVIRONMENT_KEY_SECRET_ARN"],
+        environment_key_param_name=os.environ["ENVIRONMENT_KEY_PARAM_NAME"],
         execution_role_arn=os.environ["MICROVM_EXECUTION_ROLE_ARN"],
         aws_region=region,
-        signing_secret_arn=os.environ.get("SIGNING_SECRET_ARN"),
+        signing_param_name=os.environ.get("SIGNING_PARAM_NAME"),
         base_url=os.environ.get("ANTHROPIC_BASE_URL") or None,
         max_lifetime_seconds=int(
             os.environ.get("MAX_LIFETIME_SECONDS", DEFAULT_MAX_LIFETIME_SECONDS)
@@ -246,9 +246,9 @@ def handler(
     raw_body = body if isinstance(body, str) else json.dumps(body or {})
     headers = event.get("headers") or {}
 
-    if config.signing_secret_arn:
-        signing_secret = parameters.get_secret(
-            config.signing_secret_arn, max_age=_SECRET_CACHE_SECONDS
+    if config.signing_param_name:
+        signing_secret = parameters.get_parameter(
+            config.signing_param_name, max_age=_SECRET_CACHE_SECONDS, decrypt=True
         )
         if not verifier(raw_body, headers, signing_secret):
             logger.info("denying webhook: signature verification failed")

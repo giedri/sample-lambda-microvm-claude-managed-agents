@@ -9,14 +9,14 @@
 //   POST /aws/lambda-microvms/runtime/v1/terminate (before termination)
 //
 // The /run hook receives the dispatch payload (session id, environment id,
-// secret reference, region). It acknowledges immediately (200) then:
-//   1. Fetches the environment key from Secrets Manager (VM execution role).
+// parameter reference, region). It acknowledges immediately (200) then:
+//   1. Fetches the environment key from SSM Parameter Store (VM execution role).
 //   2. Polls the work queue for the matching session.
 //   3. Handles the session's tool calls.
 //   4. Exits — idle policy drives suspend/terminate.
 
 import http from "node:http";
-import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
+import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
 import Anthropic from "@anthropic-ai/sdk";
 import { WorkPoller, EnvironmentWorker } from "@anthropic-ai/sdk/helpers/beta/environments";
 
@@ -33,24 +33,27 @@ async function readBody(req) {
   return Buffer.concat(chunks).toString("utf-8");
 }
 
-async function fetchEnvironmentKey(secretId, region) {
-  const client = new SecretsManagerClient({ region });
-  const result = await client.send(new GetSecretValueCommand({ SecretId: secretId }));
-  if (!result.SecretString) {
-    throw new Error(`secret ${secretId} has no SecretString`);
+async function fetchEnvironmentKey(parameterName, region) {
+  const client = new SSMClient({ region });
+  const result = await client.send(
+    new GetParameterCommand({ Name: parameterName, WithDecryption: true }),
+  );
+  const value = result.Parameter?.Value;
+  if (!value) {
+    throw new Error(`SSM parameter ${parameterName} has no value`);
   }
-  return result.SecretString;
+  return value;
 }
 
 // Handle exactly the session named in the dispatch.
 async function handleSession(dispatch) {
   const sessionId = dispatch.ANTHROPIC_SESSION_ID;
   const environmentId = dispatch.ANTHROPIC_ENVIRONMENT_ID;
-  const secretId = dispatch.ENVIRONMENT_KEY_SECRET_ID;
+  const parameterName = dispatch.ENVIRONMENT_KEY_PARAM_NAME;
   const region = dispatch.AWS_REGION;
   const baseURL = dispatch.ANTHROPIC_BASE_URL || undefined;
 
-  const environmentKey = await fetchEnvironmentKey(secretId, region);
+  const environmentKey = await fetchEnvironmentKey(parameterName, region);
   const client = new Anthropic({ authToken: environmentKey, baseURL });
   const worker = new EnvironmentWorker({ client, environmentId, environmentKey, workdir: "/workspace" });
 
