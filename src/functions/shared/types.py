@@ -17,10 +17,10 @@ class LauncherConfig:
 
     environment_id: str
     image_identifier: str
-    environment_key_secret_id: str
+    environment_key_param_name: str
     execution_role_arn: str
     aws_region: str
-    signing_secret_arn: Optional[str] = None
+    signing_param_name: Optional[str] = None
     base_url: Optional[str] = None
     max_lifetime_seconds: int = DEFAULT_MAX_LIFETIME_SECONDS
     launch_tps_limit: int = DEFAULT_LAUNCH_TPS_LIMIT

@@ -26,30 +26,22 @@ Parameters:
     Default: claude-self-hosted-worker
     Description: Name of the built MicroVM image the launcher runs (resolved to a full ARN below).
 
-  AnthropicEnvironmentKey:
+  EnvironmentKeyParamName:
     Type: String
-    Default: ""
-    NoEcho: true
+    Default: /claude-microvm-sandbox/anthropic-environment-key
     Description: >-
-      Optional. The Anthropic environment key (the self-hosted environment
-      credential generated in the Claude Console). If provided, the
-      stack populates the environment-key secret with it; if left blank, the
-      secret is created empty for out-of-band population. Convenient for
-      dev/test (keep the value in your local, gitignored samconfig.toml); for
-      production prefer leaving it blank and populating the secret separately.
+      Name of the SSM Parameter Store SecureString holding the Anthropic
+      environment key. CloudFormation cannot create SecureString parameters, so
+      create this parameter out-of-band after deploy (see README) with
+      `aws ssm put-parameter --type SecureString`.
 
-  WebhookSigningSecret:
+  SigningParamName:
     Type: String
-    Default: ""
-    NoEcho: true
+    Default: /claude-microvm-sandbox/anthropic-webhook-signing-secret
     Description: >-
-      Optional. The Anthropic webhook signing secret (whsec_...). Same semantics
-      as AnthropicEnvironmentKey: populated by the stack if provided, else left
-      empty for out-of-band population.
-
-Conditions:
-  HasEnvironmentKey: !Not [!Equals [!Ref AnthropicEnvironmentKey, ""]]
-  HasSigningSecret: !Not [!Equals [!Ref WebhookSigningSecret, ""]]
+      Name of the SSM Parameter Store SecureString holding the Anthropic webhook
+      signing secret (whsec_...). Create it out-of-band after deploy with
+      `aws ssm put-parameter --type SecureString`.
 
 Globals:
   Function:
@@ -75,18 +67,33 @@ Resources:
           # RunMicroVm requires the full image ARN, not a bare name. Build it
           # from the configured name + this account/region.
           MICROVM_IMAGE_IDENTIFIER: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${MicroVmImageIdentifier}"
-          ENVIRONMENT_KEY_SECRET_ARN: !Ref EnvironmentKeySecret
+          # Name of the SSM SecureString holding the environment key. Passed by
+          # *reference* (name only) into the MicroVM; the launcher never reads it.
+          ENVIRONMENT_KEY_PARAM_NAME: !Ref EnvironmentKeyParamName
           MICROVM_EXECUTION_ROLE_ARN: !GetAtt MicroVmExecutionRole.Arn
           # Webhook signature verification happens in-process (no API GW authorizer).
-          SIGNING_SECRET_ARN: !Ref SigningSecret
+          SIGNING_PARAM_NAME: !Ref SigningParamName
           # DynamoDB table backing durable webhook dedupe (Powertools Idempotency,
           # keyed on the webhook event id). Replaces the old per-instance in-memory
           # set so retried/concurrent deliveries launch exactly one MicroVM.
           IDEMPOTENCY_TABLE: !Ref IdempotencyTable
       Policies:
-        # Read only the signing secret (SAM policy template, scoped to the ARN).
-        - AWSSecretsManagerGetSecretValuePolicy:
-            SecretArn: !Ref SigningSecret
+        # Read only the signing-secret SSM SecureString, scoped to its ARN, plus
+        # kms:Decrypt for the SecureString KMS key. The default aws/ssm key ARN
+        # isn't known at template time, so Resource is "*" but bounded to SSM
+        # (kms:ViaService) AND to this one parameter (kms:EncryptionContext:
+        # PARAMETER_ARN), so the launcher can only decrypt the signing secret.
+        - Statement:
+            - Effect: Allow
+              Action: "ssm:GetParameter"
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SigningParamName}"
+            - Effect: Allow
+              Action: "kms:Decrypt"
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
+                  kms:EncryptionContext:PARAMETER_ARN: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SigningParamName}"
         # MicroVM-specific actions have no SAM policy template — explicit
         # least-privilege statements (all confirmed against the deployed service):
         - Statement:
@@ -338,27 +345,18 @@ Resources:
       SSESpecification:
         SSEEnabled: true
 
-  # --- Secrets (populate out-of-band after deploy) ------------------------
-  EnvironmentKeySecret:
-    Type: AWS::SecretsManager::Secret
-    Properties:
-      Name: !Sub "${ProjectName}/anthropic-environment-key"
-      Description: Anthropic environment key (ANTHROPIC_ENVIRONMENT_KEY).
-      # Populated from the AnthropicEnvironmentKey parameter when provided;
-      # otherwise created empty for out-of-band population.
-      SecretString: !If [HasEnvironmentKey, !Ref AnthropicEnvironmentKey, !Ref "AWS::NoValue"]
-
-  SigningSecret:
-    Type: AWS::SecretsManager::Secret
-    Properties:
-      Name: !Sub "${ProjectName}/anthropic-webhook-signing-secret"
-      Description: Anthropic webhook signing secret (whsec_...).
-      SecretString: !If [HasSigningSecret, !Ref WebhookSigningSecret, !Ref "AWS::NoValue"]
+  # --- Secrets ------------------------------------------------------------
+  # The environment key and webhook signing secret live in SSM Parameter Store
+  # as SecureString parameters. CloudFormation cannot create SecureString
+  # parameters (AWS::SSM::Parameter supports only String/StringList), so they are
+  # NOT declared here — create them out-of-band after deploy with
+  # `aws ssm put-parameter --type SecureString` (see README). Their names are
+  # supplied via the EnvironmentKeyParamName / SigningParamName stack parameters.
 
   # --- MicroVM execution role ---------------------------------------------
   # Assumed by the MicroVM at run time. The in-VM worker uses this role to fetch
-  # the environment key from Secrets Manager — the key never transits the
-  # launcher or the launch configuration (only a secret reference does).
+  # the environment key from SSM Parameter Store — the key never transits the
+  # launcher or the launch configuration (only a parameter-name reference does).
   MicroVmExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -377,9 +375,19 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              # Read only the environment-key SSM SecureString, scoped to its ARN.
               - Effect: Allow
-                Action: "secretsmanager:GetSecretValue"
-                Resource: !Ref EnvironmentKeySecret
+                Action: "ssm:GetParameter"
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${EnvironmentKeyParamName}"
+              # kms:Decrypt for the SecureString KMS key, bounded to SSM and to
+              # this one parameter via the PARAMETER_ARN encryption context.
+              - Effect: Allow
+                Action: "kms:Decrypt"
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
+                    kms:EncryptionContext:PARAMETER_ARN: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${EnvironmentKeyParamName}"
         - PolicyName: runtime-logs
           PolicyDocument:
             Version: "2012-10-17"
@@ -469,9 +477,9 @@ Outputs:
   MicroVmExecutionRoleArn:
     Description: Execution role the MicroVM assumes to read the environment key.
     Value: !GetAtt MicroVmExecutionRole.Arn
-  EnvironmentKeySecretArn:
-    Description: Populate this secret with the Anthropic environment key.
-    Value: !Ref EnvironmentKeySecret
-  SigningSecretArn:
-    Description: Populate this secret with the Anthropic webhook signing secret.
-    Value: !Ref SigningSecret
+  EnvironmentKeyParamName:
+    Description: Create this SSM SecureString parameter with the Anthropic environment key.
+    Value: !Ref EnvironmentKeyParamName
+  SigningParamName:
+    Description: Create this SSM SecureString parameter with the Anthropic webhook signing secret.
+    Value: !Ref SigningParamName

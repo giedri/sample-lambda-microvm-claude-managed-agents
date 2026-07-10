@@ -2,9 +2,9 @@
 
 Builds the per-session dispatch blob delivered to the MicroVM via runHookPayload
 (the request body of the /run lifecycle hook). Contains only non-secret data:
-session id, environment id, region, and a *reference* to the Secrets Manager
-secret holding the environment key. The environment key itself is never placed
-in this blob.
+session id, environment id, region, and a *reference* to the SSM Parameter Store
+SecureString holding the environment key. The environment key itself is never
+placed in this blob.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ def build_run_hook_payload(event: WebhookEvent, cfg: LauncherConfig) -> str:
     session: dict[str, Any] = {
         "ANTHROPIC_SESSION_ID": event.session_id,
         "ANTHROPIC_ENVIRONMENT_ID": cfg.environment_id,
-        "ENVIRONMENT_KEY_SECRET_ID": cfg.environment_key_secret_id,
+        "ENVIRONMENT_KEY_PARAM_NAME": cfg.environment_key_param_name,
         "AWS_REGION": cfg.aws_region,
     }
     if cfg.base_url is not None:
