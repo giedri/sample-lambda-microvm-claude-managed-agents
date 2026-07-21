@@ -48,8 +48,9 @@ traffic is the webhook call; the rest of the workflow is pull-based. The flow:
 4. The MicroVM receives the dispatch on its `/run` hook: it fetches the
    environment key from SSM Parameter Store using its own execution role, claims
    the matching session from the Anthropic work queue, executes the agent's tool
-   calls in `/workspace`, posts results back to Anthropic, and exits. The idle
-   policy then suspends/terminates the VM.
+   calls in `/workspace`, posts results back to Anthropic, and then calls
+   `TerminateMicrovm` on itself to release compute immediately. The idle policy
+   is only the fallback if that call can't be made.
 
 **Credential boundaries.** The organization-scoped API key is used only by the
 operator (registering the webhook, creating sessions) and never reaches AWS
@@ -206,8 +207,10 @@ scales with concurrent sessions and their duration. Monitor with AWS Cost Explor
   with least-privilege access (launcher → signing secret only; MicroVM execution
   role → environment key only). Each role's `kms:Decrypt` is bounded to its own
   parameter via the `PARAMETER_ARN` encryption context.
-- Each session runs in its own isolated MicroVM and is
-  suspended/terminated at session end; the 8-hour maximum duration bounds any VM.
+- Each session runs in its own isolated MicroVM. The worker self-terminates
+  (`lambda:TerminateMicrovm`, granted on the execution role) when the session
+  ends; the idle policy is the fallback and the 8-hour maximum duration bounds
+  any VM.
 - The S3 artifact bucket blocks public access and enables versioning and
   server-side encryption.
 - The public webhook endpoint sits behind an AWS WAF WebACL (AWS managed rule
