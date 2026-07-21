@@ -61,6 +61,8 @@ Resources:
       FunctionName: !Sub "${ProjectName}-launcher"
       CodeUri: src/functions/
       Handler: launcher.handler
+      Tags:
+        auto-delete: "no"
       Environment:
         Variables:
           ANTHROPIC_ENVIRONMENT_ID: !Ref AnthropicEnvironmentId
@@ -77,6 +79,10 @@ Resources:
           # keyed on the webhook event id). Replaces the old per-instance in-memory
           # set so retried/concurrent deliveries launch exactly one MicroVM.
           IDEMPOTENCY_TABLE: !Ref IdempotencyTable
+          # Bump to force a config update / cold start. Managed here (not out-of-band
+          # via update-function-configuration) so CloudFormation stays authoritative
+          # over the environment and does not drift.
+          CACHE_BUST: "1784675000"
       Policies:
         # Read only the signing-secret SSM SecureString, scoped to its ARN, plus
         # kms:Decrypt for the SecureString KMS key. The default aws/ssm key ARN
@@ -155,6 +161,8 @@ Resources:
       EndpointConfiguration:
         Type: REGIONAL
       TracingEnabled: true
+      Tags:
+        auto-delete: "no"
       Models:
         AnthropicWebhookEvent:
           $schema: "http://json-schema.org/draft-04/schema#"
@@ -188,6 +196,9 @@ Resources:
       Name: !Sub "${ProjectName}-webhook-web-acl"
       Scope: REGIONAL
       Description: !Sub "WAF WebACL for the ${ProjectName} webhook REST API"
+      Tags:
+        - Key: auto-delete
+          Value: "no"
       DefaultAction:
         Allow: {}
       VisibilityConfig:
@@ -294,6 +305,9 @@ Resources:
     Properties:
       LogGroupName: !Sub "aws-waf-logs-${ProjectName}-webhook"
       RetentionInDays: 30
+      Tags:
+        - Key: auto-delete
+          Value: "no"
 
   WebhookWebACLLogging:
     Type: AWS::WAFv2::LoggingConfiguration
@@ -344,6 +358,9 @@ Resources:
         Enabled: true
       SSESpecification:
         SSEEnabled: true
+      Tags:
+        - Key: auto-delete
+          Value: "no"
 
   # --- Secrets ------------------------------------------------------------
   # The environment key and webhook signing secret live in SSM Parameter Store
@@ -361,6 +378,9 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub "${ProjectName}-microvm-execution-role"
+      Tags:
+        - Key: auto-delete
+          Value: "no"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -422,11 +442,17 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      Tags:
+        - Key: auto-delete
+          Value: "no"
 
   BuildRole:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub "${ProjectName}-build-role"
+      Tags:
+        - Key: auto-delete
+          Value: "no"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:

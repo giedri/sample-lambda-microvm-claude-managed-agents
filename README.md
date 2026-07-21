@@ -152,16 +152,34 @@ lifecycle hooks enabled. Monitor the build in CloudWatch under
 
 ### 4. Verify (operator-side)
 
+The script authenticates with either an organization API key **or** an
+AWS-brokered key. Pick one:
+
 ```bash
+# Option A — organization API key (sk-ant-...)
 export ANTHROPIC_API_KEY="sk-ant-..."          # organization-scoped, operator only
+
+# Option B — AWS-brokered key (aws-external-anthropic-api-key-... / AEAAQ...)
+export ANTHROPIC_AWS_API_KEY="aws-external-anthropic-api-key-..."
+export ANTHROPIC_AWS_WORKSPACE_ID="wrkspc_..."  # workspace ID, NOT the display name
+
+# Common to both:
 export ANTHROPIC_ENVIRONMENT_ID="env_..."
 export AGENT_ID="agent_..."
 python src/scripts/verify.py --create
 ```
 
-This creates a session, triggers the webhook, launches a MicroVM, and runs the
-agent end-to-end. Confirm with `aws lambda-microvms list-microvms` /
-`get-microvm`.
+`--create` creates a session **and starts a run** (by sending an initial
+`user.message`). Starting the run is what emits the `session.status_run_started`
+webhook — creating a session alone leaves it `idle` and fires nothing. Override
+the initial message with `--prompt "..."`.
+
+This triggers the webhook, launches a MicroVM, and runs the agent end-to-end.
+Confirm with `aws lambda-microvms list-microvms` / `get-microvm`.
+
+> **Note:** AWS-brokered keys are presigned and short-lived (~12h). If a run
+> starts returning 401, regenerate the key. The workspace value must be the
+> workspace **ID** (`wrkspc_...`); a display name is rejected with a 400.
 
 ## Configuration
 
@@ -184,7 +202,9 @@ compute.
 | Symptom | Likely cause / fix |
 | --- | --- |
 | Webhook returns 401 | Signature verification failed in the launcher. Confirm the signing secret in SSM Parameter Store matches the Console, and that the delivery is fresh. |
-| No MicroVM launches | Check the launcher logs; confirm the webhook is registered for `session.status_run_started` and the image identifier is correct. |
+| No MicroVM launches | Check the launcher logs; confirm the webhook is registered for `session.status_run_started` and the image identifier is correct. Also confirm the session actually started a run — a session left `idle` never fires the webhook (`verify.py --create` starts one). |
+| Launcher logs `ignoring non-start event type=event` | The event kind lives in `data.type` (e.g. `session.status_run_started`); the top-level `type` is always the literal `event`. Parse the kind from `data["type"]`. |
+| Launcher `KeyError` on an env var (e.g. `ANTHROPIC_ENVIRONMENT_ID`) | The function's environment was changed out-of-band (e.g. `update-function-configuration`), causing CloudFormation drift the template can't self-heal. Redeploy with a changed `Environment` block (bump `CACHE_BUST`) to force CFN to rewrite it, and keep all env changes in the template. |
 | Duplicate launches | Shouldn't occur — the launcher dedupes on webhook event id; retries reuse the id. |
 | Image build fails `S3_*` | Build role/bucket issue. Confirm the artifact is in the same region, not in Glacier, and the Build role grants `s3:GetObject`. |
 | Image build fails `ARCHIVE_DOCKERFILE_NOT_FOUND` | Dockerfile must be at the root of `app.zip`; `build-image.sh` zips from inside `microvm-image/`. |

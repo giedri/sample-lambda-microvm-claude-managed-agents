@@ -31,3 +31,6 @@ _reference_docs/
 
 # Kiro IDE config (local only)
 .kiro/
+
+# Local tooling installers — never commit (e.g. AWS CLI pkg)
+*.pkg
