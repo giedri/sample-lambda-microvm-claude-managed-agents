@@ -13,10 +13,12 @@
 //   1. Fetches the environment key from SSM Parameter Store (VM execution role).
 //   2. Polls the work queue for the matching session.
 //   3. Handles the session's tool calls.
-//   4. Exits — idle policy drives suspend/terminate.
+//   4. Terminates the MicroVM (TerminateMicrovm) to release compute at once;
+//      the idle policy is only the fallback if the call can't be made.
 
 import http from "node:http";
 import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
+import { LambdaMicrovmsClient, TerminateMicrovmCommand } from "@aws-sdk/client-lambda-microvms";
 import Anthropic from "@anthropic-ai/sdk";
 import { WorkPoller, EnvironmentWorker } from "@anthropic-ai/sdk/helpers/beta/environments";
 
@@ -79,15 +81,36 @@ async function handleSession(dispatch) {
   console.warn(`worker: no work item found for session ${sessionId}`);
 }
 
-function ackThenRun(res, dispatch) {
+// Terminate this MicroVM to release compute as soon as the session finishes.
+// The microvm id comes from the /run envelope (not the inner dispatch). Best
+// effort: if the call fails, we log and fall back to the idle policy.
+async function terminateSelf(microvmId, region) {
+  if (!microvmId) {
+    console.warn("worker: no microvmId in /run envelope; leaving termination to the idle policy");
+    return;
+  }
+  try {
+    const client = new LambdaMicrovmsClient({ region });
+    await client.send(new TerminateMicrovmCommand({ microvmIdentifier: microvmId }));
+    console.log(`worker: requested termination of microvm ${microvmId}`);
+  } catch (err) {
+    console.error("worker: terminate-microvm failed; idle policy will reclaim the VM:", err);
+  }
+}
+
+function ackThenRun(res, dispatch, microvmId) {
   res.writeHead(200, { "content-type": "application/json" });
   res.end(JSON.stringify({ status: "accepted" }));
   if (sessionStarted) return;
   sessionStarted = true;
   handleSession(dispatch).then(
-    () => process.exit(0), // clean exit; idle policy suspends/terminates the VM
-    (err) => {
+    async () => {
+      await terminateSelf(microvmId, dispatch.AWS_REGION);
+      process.exit(0);
+    },
+    async (err) => {
       console.error("worker: session failed", err);
+      await terminateSelf(microvmId, dispatch.AWS_REGION);
       process.exit(1);
     },
   );
@@ -129,7 +152,9 @@ const server = http.createServer(async (req, res) => {
           res.end(JSON.stringify({ error: "missing ANTHROPIC_SESSION_ID" }));
           return;
         }
-        ackThenRun(res, dispatch);
+        // microvmId lives on the envelope, not the inner dispatch; the worker
+        // needs it to terminate itself once the session is done.
+        ackThenRun(res, dispatch, envelope.microvmId);
       } catch (err) {
         console.error("worker: /run hook error", err);
         res.writeHead(400, { "content-type": "application/json" });

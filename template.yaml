@@ -388,6 +388,18 @@ Resources:
                   StringEquals:
                     kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
                     kms:EncryptionContext:PARAMETER_ARN: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${EnvironmentKeyParamName}"
+        - PolicyName: self-terminate
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # The in-VM worker calls TerminateMicrovm on itself when the
+              # session finishes to release compute immediately (the idle policy
+              # is the fallback). Action name per the Lambda MicroVMs IAM
+              # reference. MicroVM ids are assigned at run time, so the resource
+              # can't be scoped ahead of time.
+              - Effect: Allow
+                Action: "lambda:TerminateMicrovm"
+                Resource: "*"
         - PolicyName: runtime-logs
           PolicyDocument:
             Version: "2012-10-17"
