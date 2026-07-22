@@ -12,7 +12,9 @@ Security model:
 Behavior:
 - Rejects deliveries that fail signature verification (401).
 - Ignores non-``session.status_run_started`` events (200).
-- Dedupes by webhook event id (DynamoDB-backed idempotency).
+- Dedupes by session id (DynamoDB-backed idempotency, short TTL): each agent
+  turn fires another run_started webhook, and the already-running VM's worker
+  picks up subsequent turns instead of launching a VM per turn.
 - Enforces the RunMicrovm 5 TPS rate limit.
 - On RunMicrovm failure, returns non-2xx so Anthropic retries.
 """
@@ -47,6 +49,7 @@ from shared.constants import (
     DEFAULT_LAUNCH_TPS_LIMIT,
     DEFAULT_LOGGING_CONFIG,
     DEFAULT_MAX_LIFETIME_SECONDS,
+    SESSION_DEDUPE_TTL_SECONDS,
     SESSION_RUN_STARTED,
     all_ingress_arn,
     internet_egress_arn,
@@ -59,7 +62,7 @@ from shared.types import LauncherConfig, WebhookEvent
 logger = Logger(service="claude-microvm-sandbox-launcher")
 
 _SECRET_CACHE_SECONDS = 300
-_IDEMPOTENCY_TTL_SECONDS = DEFAULT_MAX_LIFETIME_SECONDS
+_IDEMPOTENCY_TTL_SECONDS = SESSION_DEDUPE_TTL_SECONDS
 
 _SESSION_ID_PREFIX = "sesn_"
 _SESSION_ID_MAX_LEN = 128
@@ -200,9 +203,14 @@ def _build_idempotency(table_name: str) -> None:
     if _idempotent_run is not None:
         return
 
+    # Dedupe on SESSION id, not event id: every agent turn emits another
+    # session.status_run_started, and per-event dedupe would launch one VM per
+    # turn. Within the TTL the record suppresses re-launches while the already
+    # running VM (whose worker idles longer than the TTL — see
+    # WORK_IDLE_EXIT_MS in worker.mjs) picks up the session's next work item.
     persistence = DynamoDBPersistenceLayer(table_name=table_name, expiry_attr="expiration")
     _idempotency_config = IdempotencyConfig(
-        event_key_jmespath="event_id",
+        event_key_jmespath="session_id",
         expires_after_seconds=_IDEMPOTENCY_TTL_SECONDS,
     )
 
@@ -227,7 +235,7 @@ def _idempotent_executor(
             _idempotency_config.register_lambda_context(context)
         assert _idempotent_run is not None
         return _idempotent_run(
-            event_record={"event_id": event.event_id},
+            event_record={"session_id": event.session_id},
             launch=lambda: launcher._launch_and_dispatch(event),
         )
 

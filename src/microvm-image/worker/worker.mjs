@@ -35,11 +35,40 @@ import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
 import { LambdaMicrovmsClient, TerminateMicrovmCommand } from "@aws-sdk/client-lambda-microvms";
 import { fromTemporaryCredentials } from "@aws-sdk/credential-providers";
 import { WorkPoller, EnvironmentWorker } from "@anthropic-ai/sdk/helpers/beta/environments";
+import { betaAgentToolset20260401 } from "@anthropic-ai/sdk/tools/agent-toolset/node";
 
 // Hook server config.
 const HOOK_PORT = Number(process.env.HOOK_PORT || 9000);
 const HOOK_HOST = "0.0.0.0";
 const HOOK_PREFIX = "/aws/lambda-microvms/runtime/v1";
+
+// Debug mode: WORKER_DEBUG=1 logs every tool call the agent executes in this VM
+// (tool name + input, e.g. the exact bash command) and a result preview to
+// CloudWatch. Off by default — tool inputs/outputs may contain sensitive data.
+const WORKER_DEBUG = process.env.WORKER_DEBUG === "1";
+const DEBUG_RESULT_PREVIEW_CHARS = 400;
+
+// Wrap each runnable tool so its invocations are logged before/after execution.
+function withDebugLogging(tools) {
+  return tools.map((tool) => ({
+    ...tool,
+    run: async (input, context) => {
+      console.log(`worker[debug]: tool=${tool.name} input=${JSON.stringify(input)}`);
+      try {
+        const result = await tool.run(input, context);
+        const preview =
+          typeof result === "string" ? result : JSON.stringify(result);
+        console.log(
+          `worker[debug]: tool=${tool.name} ok result=${preview.slice(0, DEBUG_RESULT_PREVIEW_CHARS)}${preview.length > DEBUG_RESULT_PREVIEW_CHARS ? "…" : ""}`,
+        );
+        return result;
+      } catch (err) {
+        console.error(`worker[debug]: tool=${tool.name} FAILED:`, err);
+        throw err;
+      }
+    },
+  }));
+}
 
 // The WorkPoller/EnvironmentWorker helpers require an environmentKey string and
 // clone the client with `authToken: environmentKey`. AnthropicAws in SigV4 mode
@@ -116,34 +145,69 @@ async function buildClient(dispatch) {
   return { client, environmentKey: SIGV4_PLACEHOLDER_KEY };
 }
 
-// Handle exactly the session named in the dispatch.
+// How long to keep polling for the session's (next) work item before exiting.
+// This serves two purposes:
+//   - Startup race: the webhook races work-item creation, so a snapshot-booted
+//     VM can poll before the item is claimable — one drain pass isn't enough.
+//   - VM reuse: every agent turn emits another run_started webhook. The
+//     launcher dedupes on session id for SESSION_DEDUPE_TTL_SECONDS (300s), so
+//     this VM must keep serving the session's next turns for LONGER than that
+//     TTL — otherwise a turn arriving after the worker exits but before the
+//     dedupe record expires would be dropped. 360s > 300s keeps the handoff
+//     gap-free; the deadline resets after each handled turn.
+const WORK_IDLE_EXIT_MS = Number(process.env.WORK_IDLE_EXIT_MS || 360_000);
+const WORK_WAIT_RETRY_MS = 3_000;
+
+// Serve the session named in the dispatch: handle its work items as turns
+// arrive, exiting only after WORK_IDLE_EXIT_MS with no new work.
 async function handleSession(dispatch) {
   const sessionId = dispatch.ANTHROPIC_SESSION_ID;
   const environmentId = dispatch.ANTHROPIC_ENVIRONMENT_ID;
 
   const { client, environmentKey } = await buildClient(dispatch);
-  const worker = new EnvironmentWorker({ client, environmentId, environmentKey, workdir: "/workspace" });
-
-  console.log(`worker: looking for work item for session ${sessionId}`);
-  const poller = new WorkPoller({
+  const worker = new EnvironmentWorker({
     client,
     environmentId,
     environmentKey,
-    reclaimOlderThanMs: 2000,
-    drain: true,
-    autoStop: false,
+    workdir: "/workspace",
+    // In debug mode, bind the standard toolset ourselves so every tool call
+    // (bash command, file read/write, ...) is logged around execution.
+    ...(WORKER_DEBUG && {
+      tools: (ctx) => withDebugLogging(betaAgentToolset20260401(ctx)),
+    }),
   });
+  if (WORKER_DEBUG) console.log("worker: debug mode ON — logging all tool calls");
 
-  for await (const work of poller) {
-    if (work.data.type !== "session" || work.data.id !== sessionId) {
-      continue;
+  console.log(`worker: serving session ${sessionId}`);
+  let handled = 0;
+  let idleDeadline = Date.now() + WORK_IDLE_EXIT_MS;
+  do {
+    const poller = new WorkPoller({
+      client,
+      environmentId,
+      environmentKey,
+      reclaimOlderThanMs: 2000,
+      drain: true,
+      autoStop: false,
+    });
+
+    for await (const work of poller) {
+      if (work.data.type !== "session" || work.data.id !== sessionId) {
+        continue;
+      }
+      console.log(`worker: handling session ${sessionId} (work ${work.id})`);
+      await worker.handleItem({ workId: work.id, environmentId, sessionId, environmentKey });
+      handled += 1;
+      console.log(`worker: session ${sessionId} turn complete (${handled} handled); waiting for next turn`);
+      idleDeadline = Date.now() + WORK_IDLE_EXIT_MS;
     }
-    console.log(`worker: handling session ${sessionId} (work ${work.id})`);
-    await worker.handleItem({ workId: work.id, environmentId, sessionId, environmentKey });
-    console.log(`worker: session ${sessionId} complete`);
-    return;
-  }
-  console.warn(`worker: no work item found for session ${sessionId}`);
+    // Queue drained without our item — not claimable yet, or the session is
+    // between turns. Retry until the idle deadline.
+    await new Promise((r) => setTimeout(r, WORK_WAIT_RETRY_MS));
+  } while (Date.now() < idleDeadline);
+  console.log(
+    `worker: session ${sessionId} idle for ${WORK_IDLE_EXIT_MS}ms after ${handled} turn(s); exiting`,
+  );
 }
 
 // Terminate this MicroVM to release compute as soon as the session finishes.
