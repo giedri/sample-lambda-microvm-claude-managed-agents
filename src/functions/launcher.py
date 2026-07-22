@@ -5,9 +5,9 @@ signature in-process, then launches one MicroVM via ``RunMicrovm`` with the
 session dispatch delivered through ``runHookPayload``.
 
 Security model:
-- The launcher passes only a *reference* to the environment-key secret into the
-  MicroVM. The environment key is fetched by the VM's own execution role.
-- The organization API key never reaches AWS compute.
+- No credential is passed into the MicroVM. The in-VM worker SigV4-signs
+  requests to the Claude Platform on AWS gateway using its execution role.
+- The operator API key never reaches AWS compute.
 
 Behavior:
 - Rejects deliveries that fail signature verification (401).
@@ -176,7 +176,9 @@ def _load_config() -> LauncherConfig:
     return LauncherConfig(
         environment_id=os.environ["ANTHROPIC_ENVIRONMENT_ID"],
         image_identifier=os.environ["MICROVM_IMAGE_IDENTIFIER"],
-        environment_key_param_name=os.environ["ENVIRONMENT_KEY_PARAM_NAME"],
+        environment_key_param_name=os.environ.get("ENVIRONMENT_KEY_PARAM_NAME") or None,
+        anthropic_aws_workspace_id=os.environ.get("ANTHROPIC_AWS_WORKSPACE_ID") or None,
+        anthropic_access_role_arn=os.environ.get("ANTHROPIC_ACCESS_ROLE_ARN") or None,
         execution_role_arn=os.environ["MICROVM_EXECUTION_ROLE_ARN"],
         aws_region=region,
         signing_param_name=os.environ.get("SIGNING_PARAM_NAME"),
