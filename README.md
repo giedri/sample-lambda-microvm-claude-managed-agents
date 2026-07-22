@@ -87,7 +87,7 @@ key is never placed on any AWS compute.
 │                                    #   build role + artifact bucket
 ├── src/
 │   ├── microvm-image/               # Contents zipped into the MicroVM image
-│   │   ├── Dockerfile               # AL2023 + Node worker, /workspace, /mnt/session/outputs
+│   │   ├── Dockerfile               # AL2023 + Node 22 worker, /workspace, /mnt/session/outputs
 │   │   └── worker/worker.mjs        # HTTP lifecycle-hook server (EnvironmentWorker)
 │   ├── functions/                   # Launcher Lambda (sam build packages this)
 │   │   ├── launcher.py              # Verifies webhook signature; RunMicrovm per session
@@ -278,13 +278,52 @@ Launcher Lambda environment (set by the SAM template):
 The operator API key is **operator-only** and is never placed on any AWS
 compute.
 
+### Session lifecycle: one MicroVM per session, reused across turns
+
+Every agent turn emits a `session.status_run_started` webhook, so naive
+per-event handling would launch one VM per turn. Instead:
+
+- The **launcher dedupes on session id** (DynamoDB idempotency,
+  `SESSION_DEDUPE_TTL_SECONDS = 300`): within the TTL, repeat webhooks for the
+  same session don't launch again.
+- The **worker keeps serving the session**: after completing a turn it keeps
+  polling for the session's next work item and exits only after
+  `WORK_IDLE_EXIT_MS` (default 360 000 ms) of idleness. This also absorbs the
+  startup race where the webhook arrives before the work item is claimable.
+- The **VM idle policy** (`maxIdleDurationSeconds: 420`,
+  `suspendedDurationSeconds: 0`, `autoResumeEnabled: false`) is a backstop
+  above the worker's self-exit; per-session VMs terminate rather than suspend.
+
+The invariant that makes this gap-free: worker idle window (360 s) **>**
+dedupe TTL (300 s). A turn inside the TTL is served by the live VM; a turn
+after it launches a fresh VM. Worst case is a redundant launch that finds no
+work and idle-exits — never a dropped turn. A multi-turn conversation with
+< 5-minute gaps costs one VM; an abandoned session self-terminates in ~6–7
+minutes.
+
+### Worker debug mode
+
+Set `WORKER_DEBUG=1` in the MicroVM image's environment variables
+(`update-microvm-image --environment-variables '{"WORKER_DEBUG":"1"}'`) to log
+every tool call the agent executes — tool name and full input (e.g. the exact
+bash command) plus a 400-character result preview — to the image's CloudWatch
+log group. Off by default: tool inputs/outputs may contain sensitive data.
+`WORK_IDLE_EXIT_MS` can be tuned the same way.
+
+The MicroVM image installs **Node.js 22** (`nodejs22` on AL2023) — the
+Anthropic TypeScript SDK requires Node >= 22, and the Dockerfile fails the
+build if an older version ends up on `PATH`.
+
 ## Troubleshooting
 
 | Symptom | Likely cause / fix |
 | --- | --- |
 | Webhook returns 401 | Signature verification failed in the launcher. Confirm the signing secret in SSM Parameter Store matches the Console, and that the delivery is fresh. |
-| No MicroVM launches | Check the launcher logs; confirm the webhook is registered for `session.status_run_started` and the image identifier is correct. |
-| Duplicate launches | Shouldn't occur — the launcher dedupes on webhook event id; retries reuse the id. |
+| No MicroVM launches | Check the launcher logs; confirm the webhook is registered for `session.status_run_started` and the image identifier is correct. Also confirm the session actually started a run — a session left `idle` never fires the webhook (`verify.py --create` starts one). |
+| Launcher logs `ignoring non-start event type=event` | The event kind lives in `data.type` (e.g. `session.status_run_started`); the top-level `type` is always the literal `event`. Parse the kind from `data["type"]`. |
+| Launcher `KeyError` on an env var (e.g. `ANTHROPIC_ENVIRONMENT_ID`) | The function's environment was changed out-of-band (e.g. `update-function-configuration`), causing CloudFormation drift the template can't self-heal. Redeploy with a changed `Environment` block (bump `CACHE_BUST`) to force CFN to rewrite it, and keep all env changes in the template. |
+| One VM launched per agent turn | The launcher dedupes on **session id** for `SESSION_DEDUPE_TTL_SECONDS`; if you see per-turn launches, confirm the idempotency table is configured (`IDEMPOTENCY_TABLE`) and the worker's `WORK_IDLE_EXIT_MS` exceeds the dedupe TTL. |
+| Second run of a session hangs in the Console | The worker must outlive the dedupe window and keep polling (`WORK_IDLE_EXIT_MS`). On older images the worker exited after one drain pass, so a turn arriving later found no worker; rebuild the image. A session stuck `waiting on responses` from a dead VM needs a `user.interrupt` before it accepts new messages. |
 | Image build fails `S3_*` | Build role/bucket issue. Confirm the artifact is in the same region, not in Glacier, and the Build role grants `s3:GetObject`. |
 | Image build fails `ARCHIVE_DOCKERFILE_NOT_FOUND` | Dockerfile must be at the root of `app.zip`; `build-image.sh` zips from inside `microvm-image/`. |
 | Worker 401 `Invalid bearer token` (AWS mode) | The worker sent a bearer credential to the AWS gateway — environment keys don't work there. Deploy with `AnthropicAwsWorkspaceId` (not `EnvironmentKeyParamName`) and rebuild the image. |
