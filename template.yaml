@@ -26,14 +26,41 @@ Parameters:
     Default: claude-self-hosted-worker
     Description: Name of the built MicroVM image the launcher runs (resolved to a full ARN below).
 
+  # --- Auth mode: set EXACTLY ONE of EnvironmentKeyParamName (first-party
+  # Claude API, bearer environment key) or AnthropicAwsWorkspaceId (Claude
+  # Platform on AWS, SigV4). ---------------------------------------------------
   EnvironmentKeyParamName:
     Type: String
-    Default: /claude-microvm-sandbox/anthropic-environment-key
+    Default: ""
+    AllowedPattern: "^$|^/.+$"
     Description: >-
-      Name of the SSM Parameter Store SecureString holding the Anthropic
-      environment key. CloudFormation cannot create SecureString parameters, so
-      create this parameter out-of-band after deploy (see README) with
-      `aws ssm put-parameter --type SecureString`.
+      FIRST-PARTY MODE (api.anthropic.com). Name of the SSM Parameter Store
+      SecureString holding the Anthropic environment key. CloudFormation cannot
+      create SecureString parameters, so create it out-of-band after deploy with
+      `aws ssm put-parameter --type SecureString`. Leave empty when using
+      Claude Platform on AWS.
+
+  AnthropicAwsWorkspaceId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^wrkspc_[a-zA-Z0-9]+$"
+    Description: >-
+      CLAUDE PLATFORM ON AWS MODE. Workspace id (wrkspc_...), sent by the worker
+      as the anthropic-workspace-id header. The MicroVM authenticates to the
+      aws-external-anthropic gateway with SigV4, so no environment key or other
+      secret is needed on the VM. Leave empty when using the first-party API.
+
+  AnthropicAccessRoleArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^arn:aws[a-zA-Z-]*:iam::[0-9]{12}:role/.+$"
+    Description: >-
+      CLAUDE PLATFORM ON AWS MODE, cross-account only. ARN of the role in the
+      SUBSCRIBED account that carries AnthropicSelfHostedEnvironmentAccess (plus
+      sts:GetWebIdentityToken/TagGetWebIdentityToken) and trusts the MicroVM
+      execution role — create it with src/scripts/create-anthropic-access-role.sh.
+      Leave empty if this stack's account is itself subscribed (the execution
+      role then gets the managed policy directly).
 
   SigningParamName:
     Type: String
@@ -42,6 +69,32 @@ Parameters:
       Name of the SSM Parameter Store SecureString holding the Anthropic webhook
       signing secret (whsec_...). Create it out-of-band after deploy with
       `aws ssm put-parameter --type SecureString`.
+
+Rules:
+  ExactlyOneAuthMode:
+    Assertions:
+      - Assert: !Or
+          - !And
+            - !Not [!Equals [!Ref EnvironmentKeyParamName, ""]]
+            - !Equals [!Ref AnthropicAwsWorkspaceId, ""]
+          - !And
+            - !Equals [!Ref EnvironmentKeyParamName, ""]
+            - !Not [!Equals [!Ref AnthropicAwsWorkspaceId, ""]]
+        AssertDescription: >-
+          Set exactly one of EnvironmentKeyParamName (first-party Claude API) or
+          AnthropicAwsWorkspaceId (Claude Platform on AWS).
+
+Conditions:
+  # First-party mode: worker fetches the environment key from SSM.
+  UseEnvironmentKey: !Not [!Equals [!Ref EnvironmentKeyParamName, ""]]
+  # Claude Platform on AWS, cross-account: worker assumes a role in the
+  # subscribed account.
+  UseCrossAccountRole: !Not [!Equals [!Ref AnthropicAccessRoleArn, ""]]
+  # Claude Platform on AWS, same-account: this account is subscribed; the
+  # execution role calls the gateway directly.
+  UseDirectAwsAuth: !And
+    - !Equals [!Ref EnvironmentKeyParamName, ""]
+    - !Equals [!Ref AnthropicAccessRoleArn, ""]
 
 Globals:
   Function:
@@ -67,9 +120,17 @@ Resources:
           # RunMicroVm requires the full image ARN, not a bare name. Build it
           # from the configured name + this account/region.
           MICROVM_IMAGE_IDENTIFIER: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${MicroVmImageIdentifier}"
-          # Name of the SSM SecureString holding the environment key. Passed by
-          # *reference* (name only) into the MicroVM; the launcher never reads it.
-          ENVIRONMENT_KEY_PARAM_NAME: !Ref EnvironmentKeyParamName
+          # Auth mode passthrough — the launcher forwards whichever of these is
+          # configured into the dispatch payload, and the worker picks its auth
+          # path from what it receives. First-party mode: the SSM parameter
+          # *name* (a reference, not the key). AWS mode: workspace id and, for
+          # cross-account, the role the worker assumes. None are secrets.
+          ENVIRONMENT_KEY_PARAM_NAME:
+            !If [UseEnvironmentKey, !Ref EnvironmentKeyParamName, !Ref "AWS::NoValue"]
+          ANTHROPIC_AWS_WORKSPACE_ID:
+            !If [UseEnvironmentKey, !Ref "AWS::NoValue", !Ref AnthropicAwsWorkspaceId]
+          ANTHROPIC_ACCESS_ROLE_ARN:
+            !If [UseCrossAccountRole, !Ref AnthropicAccessRoleArn, !Ref "AWS::NoValue"]
           MICROVM_EXECUTION_ROLE_ARN: !GetAtt MicroVmExecutionRole.Arn
           # Webhook signature verification happens in-process (no API GW authorizer).
           SIGNING_PARAM_NAME: !Ref SigningParamName
@@ -346,17 +407,21 @@ Resources:
         SSEEnabled: true
 
   # --- Secrets ------------------------------------------------------------
-  # The environment key and webhook signing secret live in SSM Parameter Store
-  # as SecureString parameters. CloudFormation cannot create SecureString
-  # parameters (AWS::SSM::Parameter supports only String/StringList), so they are
-  # NOT declared here — create them out-of-band after deploy with
-  # `aws ssm put-parameter --type SecureString` (see README). Their names are
-  # supplied via the EnvironmentKeyParamName / SigningParamName stack parameters.
+  # SecureString parameters live in SSM Parameter Store. CloudFormation cannot
+  # create SecureStrings (AWS::SSM::Parameter supports only String/StringList),
+  # so they are NOT declared here — create them out-of-band after deploy with
+  # `aws ssm put-parameter --type SecureString` (see README): the webhook
+  # signing secret always (SigningParamName), and the environment key only in
+  # first-party mode (EnvironmentKeyParamName). On Claude Platform on AWS the
+  # worker authenticates with SigV4 — no environment key exists.
 
   # --- MicroVM execution role ---------------------------------------------
-  # Assumed by the MicroVM at run time. The in-VM worker uses this role to fetch
-  # the environment key from SSM Parameter Store — the key never transits the
-  # launcher or the launch configuration (only a parameter-name reference does).
+  # Assumed by the MicroVM at run time. Auth-mode dependent (see Conditions):
+  # first-party — the worker reads the environment key from SSM as this role;
+  # AWS same-account — the worker SigV4-signs gateway requests as this role;
+  # AWS cross-account — the worker sts:AssumeRole's into AnthropicAccessRoleArn
+  # and signs with the assumed credentials. In the AWS modes no secret ever
+  # transits the launcher, the launch configuration, or the VM.
   MicroVmExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -370,24 +435,62 @@ Resources:
             Action:
               - "sts:AssumeRole"
               - "sts:TagSession"
+      # Same-account Claude Platform on AWS: the execution role calls the
+      # gateway directly, so it carries the Anthropic managed policy itself.
+      ManagedPolicyArns:
+        !If
+          - UseDirectAwsAuth
+          - - !Sub "arn:${AWS::Partition}:iam::aws:policy/AnthropicSelfHostedEnvironmentAccess"
+          - !Ref "AWS::NoValue"
       Policies:
-        - PolicyName: read-environment-key
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              # Read only the environment-key SSM SecureString, scoped to its ARN.
-              - Effect: Allow
-                Action: "ssm:GetParameter"
-                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${EnvironmentKeyParamName}"
-              # kms:Decrypt for the SecureString KMS key, bounded to SSM and to
-              # this one parameter via the PARAMETER_ARN encryption context.
-              - Effect: Allow
-                Action: "kms:Decrypt"
-                Resource: "*"
-                Condition:
-                  StringEquals:
-                    kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
-                    kms:EncryptionContext:PARAMETER_ARN: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${EnvironmentKeyParamName}"
+        # First-party mode: read only the environment-key SSM SecureString.
+        - !If
+            - UseEnvironmentKey
+            - PolicyName: read-environment-key
+              PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                  - Effect: Allow
+                    Action: "ssm:GetParameter"
+                    Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${EnvironmentKeyParamName}"
+                  # kms:Decrypt for the SecureString KMS key, bounded to SSM and
+                  # to this one parameter via the PARAMETER_ARN encryption context.
+                  - Effect: Allow
+                    Action: "kms:Decrypt"
+                    Resource: "*"
+                    Condition:
+                      StringEquals:
+                        kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
+                        kms:EncryptionContext:PARAMETER_ARN: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${EnvironmentKeyParamName}"
+            - !Ref "AWS::NoValue"
+        # Claude Platform on AWS, cross-account: assume the access role in the
+        # subscribed account (which carries the Anthropic managed policy) and
+        # SigV4-sign gateway requests with the assumed credentials.
+        - !If
+            - UseCrossAccountRole
+            - PolicyName: assume-anthropic-access-role
+              PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                  - Effect: Allow
+                    Action: "sts:AssumeRole"
+                    Resource: !Ref AnthropicAccessRoleArn
+            - !Ref "AWS::NoValue"
+        # Same-account Claude Platform on AWS: the gateway exchanges the SigV4
+        # identity for a web-identity token; the managed policy above does not
+        # include these STS actions.
+        - !If
+            - UseDirectAwsAuth
+            - PolicyName: allow-get-web-identity-token
+              PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                  - Effect: Allow
+                    Action:
+                      - "sts:GetWebIdentityToken"
+                      - "sts:TagGetWebIdentityToken"
+                    Resource: !Sub "arn:${AWS::Partition}:sts::${AWS::AccountId}:self"
+            - !Ref "AWS::NoValue"
         - PolicyName: self-terminate
           PolicyDocument:
             Version: "2012-10-17"
@@ -487,11 +590,12 @@ Outputs:
     Description: Build role ARN passed to create-microvm-image.
     Value: !GetAtt BuildRole.Arn
   MicroVmExecutionRoleArn:
-    Description: Execution role the MicroVM assumes to read the environment key.
+    Description: Execution role the MicroVM assumes; SigV4-signs Claude Platform on AWS requests.
     Value: !GetAtt MicroVmExecutionRole.Arn
-  EnvironmentKeyParamName:
-    Description: Create this SSM SecureString parameter with the Anthropic environment key.
-    Value: !Ref EnvironmentKeyParamName
   SigningParamName:
     Description: Create this SSM SecureString parameter with the Anthropic webhook signing secret.
     Value: !Ref SigningParamName
+  EnvironmentKeyParamName:
+    Condition: UseEnvironmentKey
+    Description: Create this SSM SecureString parameter with the Anthropic environment key (first-party mode).
+    Value: !Ref EnvironmentKeyParamName

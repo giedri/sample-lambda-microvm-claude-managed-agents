@@ -54,12 +54,15 @@ traffic is the webhook call; the rest of the workflow is pull-based. The flow:
 
 **Credential boundaries.** The organization-scoped API key is used only by the
 operator (registering the webhook, creating sessions) and never reaches AWS
-compute. The environment key and the webhook signing secret live in AWS Systems
-Manager Parameter Store as SecureString parameters. The **launcher reads only the
-signing secret** (to verify the inbound webhook) and never handles the environment
-key — it passes only a *reference* (the parameter name) to the environment-key
-parameter into the MicroVM. The **MicroVM's execution role reads only the
-environment key**. The organization API key is never placed on any AWS compute.
+compute. The webhook signing secret lives in AWS Systems Manager Parameter Store
+as a SecureString; the **launcher reads only the signing secret** (to verify the
+inbound webhook). How the in-VM worker authenticates depends on the
+[auth mode](#choosing-an-auth-mode): against the first-party Claude API the
+launcher passes only a *reference* (the parameter name) to an environment-key
+SecureString that the **MicroVM's execution role alone reads**; on
+[Claude Platform on AWS](#claude-platform-on-aws) the worker uses AWS IAM
+(SigV4) and no Anthropic secret exists anywhere in the stack. The operator API
+key is never placed on any AWS compute.
 
 ## Prerequisites
 
@@ -70,7 +73,9 @@ environment key**. The organization API key is never placed on any AWS compute.
 - The [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html).
 - An existing Claude [Managed Agents agent](https://platform.claude.com/docs/en/managed-agents/agent-setup)
   (note its agent ID) and a `self_hosted` environment (note its `env_...` id).
-- A webhook signing secret and an environment key, both generated in the Claude Console.
+- A webhook signing secret generated in the Claude Console — plus, in
+  first-party mode only, an environment key (Claude Platform on AWS uses SigV4
+  instead; see [Choosing an auth mode](#choosing-an-auth-mode)).
 - `zip` available locally (used to package the MicroVM image source).
 
 ## Project Structure
@@ -91,13 +96,31 @@ environment key**. The organization API key is never placed on any AWS compute.
 │   │   └── wheels/                  # Vendored boto3/botocore wheels (lambda-microvms client)
 │   ├── scripts/
 │   │   ├── build-image.sh           # Zip + upload + create-microvm-image
-│   │   └── verify.py                # Operator-side: create a session to exercise the flow
+│   │   ├── create-anthropic-access-role.sh  # Cross-account role for Claude Platform on AWS
+│   │   └── verify.py                # Operator-side: create a session + start a run
 ├── docs/                            # Architecture diagram + notes
 ├── README.md  LICENSE  CONTRIBUTING.md  CODE_OF_CONDUCT.md
 └── pyproject.toml  requirements.txt
 ```
 
 `samconfig.toml` and `.aws-sam/` are generated locally by SAM and are git-ignored.
+
+## Choosing an auth mode
+
+The worker inside each MicroVM can authenticate to Anthropic two ways. Pick one
+at deploy time by setting **exactly one** of these stack parameters (the
+template rejects deploys with both or neither):
+
+| | First-party Claude API | Claude Platform on AWS |
+| --- | --- | --- |
+| Anthropic endpoint | `api.anthropic.com` | `aws-external-anthropic.{region}.api.aws` |
+| Worker credential | Environment key (bearer), fetched from SSM by reference | AWS IAM SigV4 — no secret on the VM |
+| Stack parameter | `EnvironmentKeyParamName` | `AnthropicAwsWorkspaceId` (+ `AnthropicAccessRoleArn` if cross-account) |
+| Extra secret to create | Environment key SecureString in SSM | None |
+
+Everything else — webhook, launcher, sessions, verification — is identical in
+both modes. For Claude Platform on AWS specifics (subscription, IAM,
+cross-account), see [Claude Platform on AWS](#claude-platform-on-aws) below.
 
 ## Deployment
 
@@ -112,28 +135,35 @@ The deploy is **one IaC step plus three out-of-band steps**:
 
 ```bash
 sam build
-sam deploy --guided --capabilities CAPABILITY_NAMED_IAM --parameter-overrides "AnthropicEnvironmentId=env_..."
+# First-party Claude API mode:
+sam deploy --guided --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides "AnthropicEnvironmentId=env_... EnvironmentKeyParamName=/claude-microvm-sandbox/anthropic-environment-key"
+# — or — Claude Platform on AWS mode:
+sam deploy --guided --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides "AnthropicEnvironmentId=env_... AnthropicAwsWorkspaceId=wrkspc_..."
 ```
 
 `--guided` prompts for the stack name and region and writes your answers to
 `samconfig.toml` (git-ignored), so subsequent deploys are just `sam build && sam
 deploy`. The stack outputs include `WebhookUrl`, `ArtifactBucketName`,
-`BuildRoleArn`, `EnvironmentKeyParamName`, and `SigningParamName`.
+`BuildRoleArn`, and `SigningParamName` (plus `EnvironmentKeyParamName` in
+first-party mode).
 
 ### 2. Register the webhook and create the SecureString parameters (Console + CLI)
 
-1. In the [Claude Console](https://platform.claude.com/settings/workspaces/default/webhooks),
+1. **First-party mode only:** in the [Claude Console](https://platform.claude.com/settings/workspaces/default/webhooks),
    generate the **environment key** for your `self_hosted` environment.
 2. Register the stack's `WebhookUrl` (from the deploy outputs) as a webhook
    endpoint subscribed to `session.status_run_started`. The Console will provide
    a **webhook signing secret** (`whsec_...`).
-3. Create both SSM SecureString parameters using the names from the deploy
+3. Create the SSM SecureString parameter(s) using the names from the deploy
    outputs. CloudFormation cannot create `SecureString` parameters, so this is a
    post-deploy step; the stack's IAM roles are already scoped to these names.
 
 ```bash
-aws ssm put-parameter --type SecureString --name "<EnvironmentKeyParamName>" --value "<environment-key>"
 aws ssm put-parameter --type SecureString --name "<SigningParamName>"        --value "<webhook-signing-secret>"
+# First-party mode only:
+aws ssm put-parameter --type SecureString --name "<EnvironmentKeyParamName>" --value "<environment-key>"
 ```
 
 To rotate a value later, re-run with `--overwrite`. Both parameters use the
@@ -164,6 +194,72 @@ This creates a session, triggers the webhook, launches a MicroVM, and runs the
 agent end-to-end. Confirm with `aws lambda-microvms list-microvms` /
 `get-microvm`.
 
+## Claude Platform on AWS
+
+[Claude Platform on AWS](https://platform.claude.com/docs/en/build-with-claude/claude-platform-on-aws)
+serves the Claude API through an AWS gateway
+(`aws-external-anthropic.{region}.api.aws`) with AWS-native authentication.
+**Environment keys don't exist on this platform** — the self-hosted worker
+authenticates with AWS IAM (SigV4), so no Anthropic secret is ever placed on
+the VM. Follow these steps to run this sample against it.
+
+### 1. Subscribe and collect identifiers
+
+1. Complete Claude Platform on AWS sign-up from its AWS Console service page.
+   This provisions an Anthropic organization tied to that AWS account (the
+   *subscribed account*). Resources from a first-party Anthropic org (agents,
+   environments, keys) don't carry over — create them in the new org.
+2. Create a workspace and note its id (`wrkspc_...`) from **Workspaces** on the
+   service page or in the Claude Console.
+3. Create the agent and `self_hosted` environment in this org, and note the
+   `env_...` and `agent_...` ids.
+4. Register the webhook (step 2 of [Deployment](#deployment)) in *this org's*
+   Console.
+
+### 2. Wire up IAM
+
+**Same account** (the stack deploys into the subscribed account): nothing to
+do — the template attaches the AWS-managed
+`AnthropicSelfHostedEnvironmentAccess` policy plus the required
+`sts:GetWebIdentityToken`/`sts:TagGetWebIdentityToken` grants to the MicroVM
+execution role automatically.
+
+**Cross-account** (the stack runs in a different account than the
+subscription): create a role in the *subscribed* account that the MicroVM
+execution role can assume:
+
+```bash
+AWS_PROFILE=<subscribed-account> \
+SUBSCRIBED_ACCOUNT_ID=<subscribed-account-id> \
+COMPUTE_ACCOUNT_ID=<stack-account-id> \
+./src/scripts/create-anthropic-access-role.sh
+```
+
+The script is idempotent; it creates the role with a trust policy scoped to the
+MicroVM execution role, attaches `AnthropicSelfHostedEnvironmentAccess`, and
+adds the `sts:GetWebIdentityToken`/`sts:TagGetWebIdentityToken` inline grant
+(the gateway exchanges the SigV4 identity for a web-identity token; the managed
+policy doesn't cover these). Note the printed role ARN.
+
+### 3. Deploy in AWS mode
+
+```bash
+sam deploy --capabilities CAPABILITY_NAMED_IAM --parameter-overrides \
+  "AnthropicEnvironmentId=env_... AnthropicAwsWorkspaceId=wrkspc_... AnthropicAccessRoleArn=arn:aws:iam::<subscribed-account>:role/claude-microvm-anthropic-access"
+```
+
+Omit `AnthropicAccessRoleArn` in the same-account case. Then build the MicroVM
+image and register the webhook as in [Deployment](#deployment) — the only SSM
+secret needed is the webhook signing secret.
+
+### 4. Verify
+
+Use the operator flow from [Verify](#4-verify-operator-side) with the
+AWS-brokered key (`ANTHROPIC_AWS_API_KEY` + `ANTHROPIC_AWS_WORKSPACE_ID`). In
+the worker logs (`/aws/lambda/microvms/<image-name>`) you should see
+`worker: auth mode = SigV4 (Claude Platform on AWS...)` followed by
+`worker: handling session ...`.
+
 ## Configuration
 
 Launcher Lambda environment (set by the SAM template):
@@ -173,11 +269,13 @@ Launcher Lambda environment (set by the SAM template):
 | `ANTHROPIC_ENVIRONMENT_ID` | The self-hosted environment id. |
 | `MICROVM_IMAGE_IDENTIFIER` | Name, ID, or ARN of the built MicroVM image. |
 | `SIGNING_PARAM_NAME` | SSM SecureString parameter name of the webhook signing secret (used to verify inbound webhooks). |
-| `ENVIRONMENT_KEY_PARAM_NAME` | SSM SecureString parameter name of the environment key. Passed by *reference* into the MicroVM; the launcher does not read its value. |
-| `MICROVM_EXECUTION_ROLE_ARN` | Execution role assigned to each MicroVM (used in-VM to read the environment key). |
+| `ENVIRONMENT_KEY_PARAM_NAME` (first-party mode) | SSM SecureString parameter name of the environment key. Passed by *reference* into the MicroVM; the launcher does not read its value. |
+| `ANTHROPIC_AWS_WORKSPACE_ID` (AWS mode) | Claude Platform on AWS workspace id, forwarded to the worker for the `anthropic-workspace-id` header. |
+| `ANTHROPIC_ACCESS_ROLE_ARN` (AWS mode, cross-account) | Role in the subscribed account the worker assumes before SigV4-signing gateway requests. |
+| `MICROVM_EXECUTION_ROLE_ARN` | Execution role assigned to each MicroVM. |
 | `ANTHROPIC_BASE_URL` (optional) | Override the default Claude API endpoint. |
 
-The organization API key is **operator-only** and is never placed on any AWS
+The operator API key is **operator-only** and is never placed on any AWS
 compute.
 
 ## Troubleshooting
@@ -189,6 +287,10 @@ compute.
 | Duplicate launches | Shouldn't occur — the launcher dedupes on webhook event id; retries reuse the id. |
 | Image build fails `S3_*` | Build role/bucket issue. Confirm the artifact is in the same region, not in Glacier, and the Build role grants `s3:GetObject`. |
 | Image build fails `ARCHIVE_DOCKERFILE_NOT_FOUND` | Dockerfile must be at the root of `app.zip`; `build-image.sh` zips from inside `microvm-image/`. |
+| Worker 401 `Invalid bearer token` (AWS mode) | The worker sent a bearer credential to the AWS gateway — environment keys don't work there. Deploy with `AnthropicAwsWorkspaceId` (not `EnvironmentKeyParamName`) and rebuild the image. |
+| Worker `Your account has not subscribed to this service yet` | The SigV4 identity belongs to an AWS account without a Claude Platform on AWS subscription. Use the cross-account role (`AnthropicAccessRoleArn`) or deploy into the subscribed account. |
+| Worker `AccessDenied ... sts:AssumeRole` (cross-account) | Trust policy on the access role doesn't match the MicroVM execution role ARN, or the role name differs from the deployed `AnthropicAccessRoleArn`. Re-run `create-anthropic-access-role.sh`. |
+| Worker 403 `sts:GetWebIdentityToken` / `sts:TagGetWebIdentityToken` | The role the worker signs as is missing those STS grants (the Anthropic managed policy doesn't include them). Re-run `create-anthropic-access-role.sh`, or redeploy (same-account mode adds them automatically). |
 
 ## Cost
 
@@ -199,14 +301,20 @@ scales with concurrent sessions and their duration. Monitor with AWS Cost Explor
 
 ## Security
 
-- The organization API key never reaches AWS compute or a MicroVM; only the
-  per-session id and a *reference* to the environment-key parameter are forwarded.
+- The operator API key never reaches AWS compute or a MicroVM; the dispatch
+  payload carries only the per-session id and non-secret auth-mode fields (an
+  SSM parameter *name* in first-party mode; a workspace id / role ARN in AWS
+  mode).
+- On Claude Platform on AWS no Anthropic secret exists anywhere in the stack —
+  the worker authenticates with short-lived SigV4 credentials from the VM's
+  execution role (optionally via a scoped cross-account assume-role).
 - The webhook is authenticated by signature verification in the launcher Lambda;
   invalid or stale deliveries are denied (401) before any MicroVM is launched.
 - Secrets live in AWS Systems Manager Parameter Store as SecureString parameters
-  with least-privilege access (launcher → signing secret only; MicroVM execution
-  role → environment key only). Each role's `kms:Decrypt` is bounded to its own
-  parameter via the `PARAMETER_ARN` encryption context.
+  with least-privilege access (launcher → signing secret only; in first-party
+  mode, MicroVM execution role → environment key only). Each role's
+  `kms:Decrypt` is bounded to its own parameter via the `PARAMETER_ARN`
+  encryption context.
 - Each session runs in its own isolated MicroVM. The worker self-terminates
   (`lambda:TerminateMicrovm`, granted on the execution role) when the session
   ends; the idle policy is the fallback and the 8-hour maximum duration bounds
