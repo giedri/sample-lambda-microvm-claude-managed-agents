@@ -6,11 +6,15 @@
 ARG BASE_IMAGE=public.ecr.aws/lambda/microvms:al2023-minimal
 FROM ${BASE_IMAGE}
 
-# Worker runtime dependencies.
+# Worker runtime dependencies. The Anthropic TypeScript SDK (and the worker's
+# engines field) require Node.js >= 22; AL2023's default `nodejs` package is
+# 18, so install the versioned nodejs22 package and expose it as `node`/`npm`.
 RUN dnf install -y --setopt=install_weak_deps=0 bash unzip tar gzip && \
     (command -v curl >/dev/null 2>&1 || dnf install -y curl) && \
-    dnf install -y nodejs npm && \
-    node --version && \
+    dnf install -y nodejs22 nodejs22-npm && \
+    ln -sf /usr/bin/node-22 /usr/local/bin/node && \
+    ln -sf /usr/bin/npm-22 /usr/local/bin/npm && \
+    node --version | grep -q "^v22" && \
     dnf clean all
 
 WORKDIR /workspace
