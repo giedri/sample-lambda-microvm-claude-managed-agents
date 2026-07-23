@@ -13,17 +13,18 @@
 # Claude Platform on AWS requests with the assumed credentials.
 #
 # Usage:
-#   ./create-anthropic-access-role.sh
+#   SUBSCRIBED_ACCOUNT_ID=<subscribed-account-id> COMPUTE_ACCOUNT_ID=<compute-account-id> \
+#     ./create-anthropic-access-role.sh
 #
-# Environment overrides:
-#   SUBSCRIBED_ACCOUNT_ID  Account this role is created in   (default: <SUBSCRIBED_ACCOUNT_ID>)
-#   COMPUTE_ACCOUNT_ID     Account the MicroVMs run in       (default: <COMPUTE_ACCOUNT_ID>)
+# Environment variables:
+#   SUBSCRIBED_ACCOUNT_ID  Account this role is created in   (required)
+#   COMPUTE_ACCOUNT_ID     Account the MicroVMs run in       (required)
 #   ROLE_NAME              Name of the role to create        (default: claude-microvm-anthropic-access)
 #   EXECUTION_ROLE_NAME    Trusted MicroVM execution role    (default: claude-microvm-sandbox-microvm-execution-role)
 set -euo pipefail
 
-SUBSCRIBED_ACCOUNT_ID="${SUBSCRIBED_ACCOUNT_ID:-<SUBSCRIBED_ACCOUNT_ID>}"
-COMPUTE_ACCOUNT_ID="${COMPUTE_ACCOUNT_ID:-<COMPUTE_ACCOUNT_ID>}"
+SUBSCRIBED_ACCOUNT_ID="${SUBSCRIBED_ACCOUNT_ID:?Set SUBSCRIBED_ACCOUNT_ID to the account with the Claude Platform on AWS subscription}"
+COMPUTE_ACCOUNT_ID="${COMPUTE_ACCOUNT_ID:?Set COMPUTE_ACCOUNT_ID to the account where the MicroVM sandbox stack runs}"
 ROLE_NAME="${ROLE_NAME:-claude-microvm-anthropic-access}"
 EXECUTION_ROLE_NAME="${EXECUTION_ROLE_NAME:-claude-microvm-sandbox-microvm-execution-role}"
 
