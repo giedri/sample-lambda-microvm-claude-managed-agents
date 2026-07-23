@@ -74,7 +74,7 @@ function withDebugLogging(tools) {
   return tools.map((tool) => ({
     ...tool,
     run: async (input, context) => {
-      console.log(`worker[debug]: tool=${tool.name} input=${JSON.stringify(input)}`);
+      dbg(`tool=${tool.name} input=`, input);
       try {
         const result = await tool.run(input, context);
         const preview =
@@ -131,6 +131,15 @@ async function buildClient(dispatch) {
     return { client: new Anthropic({ authToken: environmentKey, baseURL }), environmentKey };
   }
 
+  if (!dispatch.ANTHROPIC_AWS_WORKSPACE_ID) {
+    // Neither auth field present — likely launcher env drift (the template
+    // Rules guarantee one is set at deploy time). Fail loudly.
+    throw new Error(
+      "dispatch has neither ENVIRONMENT_KEY_PARAM_NAME nor ANTHROPIC_AWS_WORKSPACE_ID; " +
+        "check the launcher Lambda's environment for drift",
+    );
+  }
+
   // Claude Platform on AWS: SigV4. Cross-account when an access role is given —
   // fromTemporaryCredentials auto-refreshes before the STS expiry, so sessions
   // can outlive the 1-hour credential lifetime. The region-derived base URL
@@ -166,16 +175,11 @@ async function buildClient(dispatch) {
   return { client, environmentKey: SIGV4_PLACEHOLDER_KEY };
 }
 
-// How long to keep polling for the session's (next) work item before exiting.
-// This serves two purposes:
-//   - Startup race: the webhook races work-item creation, so a snapshot-booted
-//     VM can poll before the item is claimable — one drain pass isn't enough.
-//   - VM reuse: every agent turn emits another run_started webhook. The
-//     launcher dedupes on session id for SESSION_DEDUPE_TTL_SECONDS (300s), so
-//     this VM must keep serving the session's next turns for LONGER than that
-//     TTL — otherwise a turn arriving after the worker exits but before the
-//     dedupe record expires would be dropped. 360s > 300s keeps the handoff
-//     gap-free; the deadline resets after each handled turn.
+// How long to keep polling for the session's next work item before exiting.
+// Covers the startup race (the webhook can beat work-item creation) and VM
+// reuse across turns. MUST exceed the launcher's SESSION_DEDUPE_TTL_SECONDS
+// (300s) — a turn arriving after the worker exits but before the dedupe record
+// expires would otherwise be dropped. The deadline resets after each turn.
 const WORK_IDLE_EXIT_MS = Number(process.env.WORK_IDLE_EXIT_MS || 360_000);
 const WORK_WAIT_RETRY_MS = 3_000;
 
@@ -207,21 +211,13 @@ async function handleSession(dispatch) {
     workWaitRetryMs: WORK_WAIT_RETRY_MS,
   });
 
-  // Poll the environment work queue with the RAW poll endpoint — deliberately
-  // NOT the WorkPoller helper. The queue is environment-wide and this VM is
-  // pinned to one session, but WorkPoller acks (= permanently claims) every
-  // item BEFORE yielding it, so a session-pinned consumer that skips a foreign
-  // item would consume another session's turn and drop it — that session's VM
-  // then starves and its Console hangs. The raw poll only leases the item:
-  // left un-acked, the server reclaims it after reclaim_older_than_ms and the
-  // right VM picks it up. We ack only items that belong to OUR session, then
-  // hand them to EnvironmentWorker.handleItem (which heartbeats the lease and
-  // force-stops the item on exit).
-  //
-  // Poll/ack authenticate as the environment. Our client already carries the
-  // right credential for the mode — buildClient returns first-party clients
-  // constructed with `authToken: environmentKey`, and AnthropicAws signs with
-  // SigV4 — so no helper-style re-auth clone is needed here.
+  // Poll the environment work queue with the RAW poll endpoint, NOT the
+  // WorkPoller helper: the queue is environment-wide, this VM is pinned to one
+  // session, and WorkPoller acks (= permanently claims) every item BEFORE
+  // yielding it — a session-pinned consumer would consume and drop other
+  // sessions' turns, starving their VMs. The raw poll only leases; un-acked
+  // items are reclaimed after reclaim_older_than_ms by the rightful VM. We ack
+  // only our own session's items, then hand them to EnvironmentWorker.handleItem.
   const pollClient = client;
 
   let handled = 0;
@@ -263,8 +259,7 @@ async function handleSession(dispatch) {
     });
 
     if (work.data?.type !== "session" || work.data?.id !== sessionId) {
-      // Another session's work (or a non-session item). Do NOT ack and do NOT
-      // stop it — leave the lease to expire so its own VM can reclaim it.
+      // Another session's work — leave the lease to expire for its own VM.
       foreignSeen += 1;
       dbg("poll.foreign", {
         cycle: pollCycle,
@@ -290,10 +285,18 @@ async function handleSession(dispatch) {
     }
 
     console.log(`worker: handling session ${sessionId} (work ${work.id})`);
-    await worker.handleItem({ workId: work.id, environmentId, sessionId, environmentKey });
-    handled += 1;
-    console.log(`worker: session ${sessionId} turn complete (${handled} handled); waiting for next turn`);
-    idleDeadline = Date.now() + WORK_IDLE_EXIT_MS;
+    try {
+      await worker.handleItem({ workId: work.id, environmentId, sessionId, environmentKey });
+      handled += 1;
+      console.log(`worker: session ${sessionId} turn complete (${handled} handled); waiting for next turn`);
+      idleDeadline = Date.now() + WORK_IDLE_EXIT_MS;
+    } catch (err) {
+      // Keep serving: if this VM exited here, the launcher's dedupe record
+      // would suppress a relaunch until the TTL expires, stalling the
+      // session's next turns. The deadline deliberately does NOT reset on
+      // failure, so persistent errors still drain the idle window and exit.
+      console.error(`worker: turn failed for session ${sessionId} (work ${work.id}); continuing to poll:`, err);
+    }
   } while (Date.now() < idleDeadline);
   console.log(
     `worker: session ${sessionId} idle for ${WORK_IDLE_EXIT_MS}ms after ${handled} turn(s) over ${pollCycle} poll cycle(s) (${foreignSeen} foreign item(s) left for reclaim); exiting`,

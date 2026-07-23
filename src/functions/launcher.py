@@ -5,8 +5,11 @@ signature in-process, then launches one MicroVM via ``RunMicrovm`` with the
 session dispatch delivered through ``runHookPayload``.
 
 Security model:
-- No credential is passed into the MicroVM. The in-VM worker SigV4-signs
-  requests to the Claude Platform on AWS gateway using its execution role.
+- No credential is passed into the MicroVM. In first-party mode the launcher
+  forwards only a *reference* (the SSM parameter name) to the environment key,
+  which the VM's own execution role fetches; on Claude Platform on AWS the
+  worker SigV4-signs gateway requests with its execution role and no Anthropic
+  secret exists at all.
 - The operator API key never reaches AWS compute.
 
 Behavior:
@@ -176,11 +179,21 @@ class Launcher:
 
 def _load_config() -> LauncherConfig:
     region = os.environ.get("AWS_REGION", "us-west-2")
+    environment_key_param_name = os.environ.get("ENVIRONMENT_KEY_PARAM_NAME") or None
+    anthropic_aws_workspace_id = os.environ.get("ANTHROPIC_AWS_WORKSPACE_ID") or None
+    # The template Rules guarantee exactly one auth mode at deploy time, but the
+    # function environment can drift out-of-band — fail here with a clear error
+    # rather than dispatching a payload the worker can't authenticate with.
+    if not environment_key_param_name and not anthropic_aws_workspace_id:
+        raise RuntimeError(
+            "Neither ENVIRONMENT_KEY_PARAM_NAME nor ANTHROPIC_AWS_WORKSPACE_ID is set; "
+            "the launcher environment has drifted from the template — redeploy the stack."
+        )
     return LauncherConfig(
         environment_id=os.environ["ANTHROPIC_ENVIRONMENT_ID"],
         image_identifier=os.environ["MICROVM_IMAGE_IDENTIFIER"],
-        environment_key_param_name=os.environ.get("ENVIRONMENT_KEY_PARAM_NAME") or None,
-        anthropic_aws_workspace_id=os.environ.get("ANTHROPIC_AWS_WORKSPACE_ID") or None,
+        environment_key_param_name=environment_key_param_name,
+        anthropic_aws_workspace_id=anthropic_aws_workspace_id,
         anthropic_access_role_arn=os.environ.get("ANTHROPIC_ACCESS_ROLE_ARN") or None,
         execution_role_arn=os.environ["MICROVM_EXECUTION_ROLE_ARN"],
         aws_region=region,
@@ -203,11 +216,8 @@ def _build_idempotency(table_name: str) -> None:
     if _idempotent_run is not None:
         return
 
-    # Dedupe on SESSION id, not event id: every agent turn emits another
-    # session.status_run_started, and per-event dedupe would launch one VM per
-    # turn. Within the TTL the record suppresses re-launches while the already
-    # running VM (whose worker idles longer than the TTL — see
-    # WORK_IDLE_EXIT_MS in worker.mjs) picks up the session's next work item.
+    # Dedupe on SESSION id, not event id — see SESSION_DEDUPE_TTL_SECONDS in
+    # shared/constants.py for the TTL/worker-idle invariant.
     persistence = DynamoDBPersistenceLayer(table_name=table_name, expiry_attr="expiration")
     _idempotency_config = IdempotencyConfig(
         event_key_jmespath="session_id",

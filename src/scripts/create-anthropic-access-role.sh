@@ -72,7 +72,6 @@ else
     --role-name "${ROLE_NAME}" \
     --assume-role-policy-document "${TRUST_POLICY}" \
     --description "Assumed by the Claude MicroVM sandbox worker in ${COMPUTE_ACCOUNT_ID} to call Claude Platform on AWS." \
-    --tags Key=auto-delete,Value=no \
     >/dev/null
   echo "Role created."
 fi

@@ -16,14 +16,12 @@ def internet_egress_arn(region: str) -> str:
 
 DEFAULT_MAX_LIFETIME_SECONDS = 28800  # 8 hours
 
-# How long a session's launch record suppresses further launches for the SAME
-# session. Every agent turn emits session.status_run_started, so deduping on
-# event id alone launches one VM per turn. Instead the launcher dedupes on
-# session id for this window, and the in-VM worker keeps polling for the
-# session's next work item (WORK_IDLE_EXIT_MS, 360s > this TTL) so one VM
-# serves consecutive turns. The worker outliving the record guarantees a new
-# run is never dropped: worst case a redundant VM launches, finds no work, and
-# idle-exits.
+# Session-id launch dedupe window. Every agent turn emits run_started, so
+# per-event dedupe would launch one VM per turn; instead the live VM keeps
+# polling for the session's next item. Invariant: the worker's idle window
+# (WORK_IDLE_EXIT_MS, 360s) must EXCEED this TTL so no turn lands after the
+# worker exits but before the record expires — worst case is a redundant
+# launch that finds no work and idle-exits, never a dropped turn.
 SESSION_DEDUPE_TTL_SECONDS = 300
 
 DEFAULT_LAUNCH_TPS_LIMIT = 5

@@ -190,16 +190,34 @@ logging — see [Worker debug mode](#worker-debug-mode).
 
 ### 4. Verify (operator-side)
 
+The script authenticates with either an organization API key **or** an
+AWS-brokered key. Pick one:
+
 ```bash
+# Option A — organization API key (sk-ant-...)
 export ANTHROPIC_API_KEY="sk-ant-..."          # organization-scoped, operator only
+
+# Option B — AWS-brokered key (aws-external-anthropic-api-key-...)
+export ANTHROPIC_AWS_API_KEY="aws-external-anthropic-api-key-..."
+export ANTHROPIC_AWS_WORKSPACE_ID="wrkspc_..."  # workspace ID, NOT the display name
+
+# Common to both:
 export ANTHROPIC_ENVIRONMENT_ID="env_..."
 export AGENT_ID="agent_..."
 python src/scripts/verify.py --create
 ```
 
-This creates a session, triggers the webhook, launches a MicroVM, and runs the
-agent end-to-end. Confirm with `aws lambda-microvms list-microvms` /
-`get-microvm`.
+`--create` creates a session **and starts a run** (by sending an initial
+`user.message`). Starting the run is what emits the `session.status_run_started`
+webhook — creating a session alone leaves it `idle` and fires nothing. Override
+the initial message with `--prompt "..."`.
+
+This triggers the webhook, launches a MicroVM, and runs the agent end-to-end.
+Confirm with `aws lambda-microvms list-microvms` / `get-microvm`.
+
+> **Note:** AWS-brokered keys are presigned and short-lived (~12h). If a run
+> starts returning 401, regenerate the key. The workspace value must be the
+> workspace **ID** (`wrkspc_...`); a display name is rejected with a 400.
 
 ## Claude Platform on AWS
 
@@ -280,7 +298,8 @@ Launcher Lambda environment (set by the SAM template):
 | `ANTHROPIC_AWS_WORKSPACE_ID` (AWS mode) | Claude Platform on AWS workspace id, forwarded to the worker for the `anthropic-workspace-id` header. |
 | `ANTHROPIC_ACCESS_ROLE_ARN` (AWS mode, cross-account) | Role in the subscribed account the worker assumes before SigV4-signing gateway requests. |
 | `MICROVM_EXECUTION_ROLE_ARN` | Execution role assigned to each MicroVM. |
-| `ANTHROPIC_BASE_URL` (optional) | Override the default Claude API endpoint. |
+| `IDEMPOTENCY_TABLE` | DynamoDB table backing the session-id launch dedupe. |
+| `ANTHROPIC_BASE_URL` (optional, not set by the template) | Override the default Claude API endpoint. Add it to the template's `Environment` block if needed — don't set it out-of-band (see the env-drift troubleshooting row). |
 
 The operator API key is **operator-only** and is never placed on any AWS
 compute.
@@ -338,7 +357,7 @@ build if an older version ends up on `PATH`.
 | Webhook returns 401 | Signature verification failed in the launcher. Confirm the signing secret in SSM Parameter Store matches the Console, and that the delivery is fresh. |
 | No MicroVM launches | Check the launcher logs; confirm the webhook is registered for `session.status_run_started` and the image identifier is correct. Also confirm the session actually started a run — a session left `idle` never fires the webhook (`verify.py --create` starts one). |
 | Launcher logs `ignoring non-start event type=event` | The event kind lives in `data.type` (e.g. `session.status_run_started`); the top-level `type` is always the literal `event`. Parse the kind from `data["type"]`. |
-| Launcher `KeyError` on an env var (e.g. `ANTHROPIC_ENVIRONMENT_ID`) | The function's environment was changed out-of-band (e.g. `update-function-configuration`), causing CloudFormation drift the template can't self-heal. Redeploy with a changed `Environment` block (bump `CACHE_BUST`) to force CFN to rewrite it, and keep all env changes in the template. |
+| Launcher `KeyError` on an env var (e.g. `ANTHROPIC_ENVIRONMENT_ID`) | The function's environment was changed out-of-band (e.g. `update-function-configuration`), causing CloudFormation drift the template can't self-heal. Redeploy with a changed `Environment` block (e.g. add/bump a `CACHE_BUST` variable in the template) to force CFN to rewrite it, and keep all env changes in the template. |
 | One VM launched per agent turn | The launcher dedupes on **session id** for `SESSION_DEDUPE_TTL_SECONDS`; if you see per-turn launches, confirm the idempotency table is configured (`IDEMPOTENCY_TABLE`) and the worker's `WORK_IDLE_EXIT_MS` exceeds the dedupe TTL. |
 | Second run of a session hangs in the Console | The worker must outlive the dedupe window and keep polling (`WORK_IDLE_EXIT_MS`). On older images the worker exited after one drain pass, so a turn arriving later found no worker; rebuild the image. A session stuck `waiting on responses` from a dead VM needs a `user.interrupt` before it accepts new messages. |
 | Session hangs with the VM alive but idle (worker logs poll cycles finding no work while another session runs) | Cross-session work-item theft: a VM must claim (`ack`) only its own session's items and leave foreign items un-acked for the rightful VM to reclaim. A worker that claims-then-skips a foreign item strands it and starves the other session. Fixed in current images (raw poll + selective ack); rebuild if you see this. `WORKER_DEBUG=1` shows `poll.foreign` / `poll.item` lines that confirm it. |
@@ -353,7 +372,7 @@ build if an older version ends up on `PATH`.
 
 Costs are driven primarily by MicroVM run time (per AWS Lambda MicroVMs pricing),
 plus standard API Gateway, Lambda, SSM Parameter Store, and S3 usage. Because each
-session runs in its own MicroVM that is suspended/terminated at session end, cost
+session runs in its own MicroVM that self-terminates at session end, cost
 scales with concurrent sessions and their duration. Monitor with AWS Cost Explorer.
 
 ## Security
