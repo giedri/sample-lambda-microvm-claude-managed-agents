@@ -34,7 +34,7 @@ import { AnthropicAws } from "@anthropic-ai/aws-sdk";
 import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
 import { LambdaMicrovmsClient, TerminateMicrovmCommand } from "@aws-sdk/client-lambda-microvms";
 import { fromTemporaryCredentials } from "@aws-sdk/credential-providers";
-import { WorkPoller, EnvironmentWorker } from "@anthropic-ai/sdk/helpers/beta/environments";
+import { EnvironmentWorker } from "@anthropic-ai/sdk/helpers/beta/environments";
 import { betaAgentToolset20260401 } from "@anthropic-ai/sdk/tools/agent-toolset/node";
 
 // Hook server config.
@@ -91,11 +91,11 @@ function withDebugLogging(tools) {
   }));
 }
 
-// The WorkPoller/EnvironmentWorker helpers require an environmentKey string and
-// clone the client with `authToken: environmentKey`. AnthropicAws in SigV4 mode
+// The EnvironmentWorker helper requires an environmentKey string and clones
+// the client with `authToken: environmentKey`. AnthropicAws in SigV4 mode
 // intentionally supersedes any clone-supplied authToken (the gateway
 // authenticates the SigV4 identity), so in AWS mode this placeholder satisfies
-// the helpers without ever reaching the wire.
+// the helper without ever reaching the wire.
 const SIGV4_PLACEHOLDER_KEY = "unused-sigv4-auth";
 
 let sessionStarted = false; // guard: handle the session at most once per VM
@@ -206,60 +206,97 @@ async function handleSession(dispatch) {
     workIdleExitMs: WORK_IDLE_EXIT_MS,
     workWaitRetryMs: WORK_WAIT_RETRY_MS,
   });
+
+  // Poll the environment work queue with the RAW poll endpoint — deliberately
+  // NOT the WorkPoller helper. The queue is environment-wide and this VM is
+  // pinned to one session, but WorkPoller acks (= permanently claims) every
+  // item BEFORE yielding it, so a session-pinned consumer that skips a foreign
+  // item would consume another session's turn and drop it — that session's VM
+  // then starves and its Console hangs. The raw poll only leases the item:
+  // left un-acked, the server reclaims it after reclaim_older_than_ms and the
+  // right VM picks it up. We ack only items that belong to OUR session, then
+  // hand them to EnvironmentWorker.handleItem (which heartbeats the lease and
+  // force-stops the item on exit).
+  //
+  // Poll/ack authenticate as the environment. Our client already carries the
+  // right credential for the mode — buildClient returns first-party clients
+  // constructed with `authToken: environmentKey`, and AnthropicAws signs with
+  // SigV4 — so no helper-style re-auth clone is needed here.
+  const pollClient = client;
+
   let handled = 0;
   let pollCycle = 0;
+  let foreignSeen = 0;
   let idleDeadline = Date.now() + WORK_IDLE_EXIT_MS;
   do {
     pollCycle += 1;
-    let seen = 0;
-    let matched = 0;
-    dbg("poll.begin", { cycle: pollCycle, msToDeadline: idleDeadline - Date.now() });
-    const poller = new WorkPoller({
-      client,
-      environmentId,
-      environmentKey,
-      reclaimOlderThanMs: 2000,
-      drain: true,
-      autoStop: false,
+    let work = null;
+    try {
+      // block_ms: server-side long poll (API caps it at 999ms) so an empty
+      // queue doesn't busy-spin; reclaim_older_than_ms: how stale an un-acked
+      // lease must be before the server hands the item out again.
+      work = await pollClient.beta.environments.work.poll(environmentId, {
+        block_ms: 999,
+        reclaim_older_than_ms: 2000,
+      });
+    } catch (err) {
+      dbg("poll.error", { cycle: pollCycle, message: err?.message || String(err), status: err?.status });
+      if (WORKER_DEBUG) console.error("worker[debug]: poll threw:", err);
+      // Transient failure — wait and retry until the idle deadline.
+      await new Promise((r) => setTimeout(r, WORK_WAIT_RETRY_MS));
+      continue;
+    }
+
+    if (work == null) {
+      dbg("poll.empty", { cycle: pollCycle, msToDeadline: idleDeadline - Date.now() });
+      await new Promise((r) => setTimeout(r, WORK_WAIT_RETRY_MS));
+      continue;
+    }
+
+    dbg("poll.item", {
+      cycle: pollCycle,
+      workId: work.id,
+      dataType: work.data?.type,
+      dataId: work.data?.id,
+      state: work.state,
+      matchesSession: work.data?.type === "session" && work.data?.id === sessionId,
     });
 
-    try {
-      for await (const work of poller) {
-        seen += 1;
-        // Log every item the poller yields, matching or not — this is how we
-        // tell "empty queue" apart from "item present but filtered out".
-        dbg("poll.item", {
-          cycle: pollCycle,
-          workId: work.id,
-          dataType: work.data?.type,
-          dataId: work.data?.id,
-          matchesSession: work.data?.type === "session" && work.data?.id === sessionId,
-        });
-        if (work.data.type !== "session" || work.data.id !== sessionId) {
-          dbg("poll.skip", { cycle: pollCycle, workId: work.id, reason: work.data?.type !== "session" ? "type" : "sessionId" });
-          continue;
-        }
-        matched += 1;
-        console.log(`worker: handling session ${sessionId} (work ${work.id})`);
-        await worker.handleItem({ workId: work.id, environmentId, sessionId, environmentKey });
-        handled += 1;
-        console.log(`worker: session ${sessionId} turn complete (${handled} handled); waiting for next turn`);
-        idleDeadline = Date.now() + WORK_IDLE_EXIT_MS;
-      }
-    } catch (err) {
-      // A throw inside the async iterator (poll/ack HTTP error, auth failure,
-      // abort) would otherwise be invisible — it just ends the for-await. Log
-      // it and let the retry loop try again until the idle deadline.
-      dbg("poll.error", { cycle: pollCycle, message: err?.message || String(err), name: err?.name });
-      if (WORKER_DEBUG) console.error("worker[debug]: poll cycle threw:", err);
+    if (work.data?.type !== "session" || work.data?.id !== sessionId) {
+      // Another session's work (or a non-session item). Do NOT ack and do NOT
+      // stop it — leave the lease to expire so its own VM can reclaim it.
+      foreignSeen += 1;
+      dbg("poll.foreign", {
+        cycle: pollCycle,
+        workId: work.id,
+        reason: work.data?.type !== "session" ? "type" : "sessionId",
+        action: "left for reclaim",
+      });
+      // Back off past the reclaim window so we don't immediately re-lease the
+      // same foreign item and shut its rightful VM out.
+      await new Promise((r) => setTimeout(r, WORK_WAIT_RETRY_MS));
+      continue;
     }
-    dbg("poll.drained", { cycle: pollCycle, seen, matched, retryInMs: WORK_WAIT_RETRY_MS });
-    // Queue drained without our item — not claimable yet, or the session is
-    // between turns. Retry until the idle deadline.
-    await new Promise((r) => setTimeout(r, WORK_WAIT_RETRY_MS));
+
+    // Ours: claim it for real, then serve the turn.
+    try {
+      await pollClient.beta.environments.work.ack(work.id, { environment_id: environmentId });
+    } catch (err) {
+      // Lost the claim race (another VM of this session acked first) or a
+      // transient error — either way the item is not ours to run; retry.
+      dbg("ack.failed", { cycle: pollCycle, workId: work.id, message: err?.message || String(err), status: err?.status });
+      await new Promise((r) => setTimeout(r, WORK_WAIT_RETRY_MS));
+      continue;
+    }
+
+    console.log(`worker: handling session ${sessionId} (work ${work.id})`);
+    await worker.handleItem({ workId: work.id, environmentId, sessionId, environmentKey });
+    handled += 1;
+    console.log(`worker: session ${sessionId} turn complete (${handled} handled); waiting for next turn`);
+    idleDeadline = Date.now() + WORK_IDLE_EXIT_MS;
   } while (Date.now() < idleDeadline);
   console.log(
-    `worker: session ${sessionId} idle for ${WORK_IDLE_EXIT_MS}ms after ${handled} turn(s) over ${pollCycle} poll cycle(s); exiting`,
+    `worker: session ${sessionId} idle for ${WORK_IDLE_EXIT_MS}ms after ${handled} turn(s) over ${pollCycle} poll cycle(s) (${foreignSeen} foreign item(s) left for reclaim); exiting`,
   );
 }
 
