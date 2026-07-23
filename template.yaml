@@ -83,6 +83,16 @@ Rules:
         AssertDescription: >-
           Set exactly one of EnvironmentKeyParamName (first-party Claude API) or
           AnthropicAwsWorkspaceId (Claude Platform on AWS).
+      # The access role only makes sense in AWS mode — reject it alongside the
+      # environment key so first-party deploys never carry an unused (but
+      # exercisable) cross-account sts:AssumeRole grant.
+      - Assert: !Or
+          - !Equals [!Ref AnthropicAccessRoleArn, ""]
+          - !Not [!Equals [!Ref AnthropicAwsWorkspaceId, ""]]
+        AssertDescription: >-
+          AnthropicAccessRoleArn requires AnthropicAwsWorkspaceId (Claude
+          Platform on AWS mode); it cannot be combined with
+          EnvironmentKeyParamName.
 
 Conditions:
   # First-party mode: worker fetches the environment key from SSM.
@@ -134,9 +144,10 @@ Resources:
           MICROVM_EXECUTION_ROLE_ARN: !GetAtt MicroVmExecutionRole.Arn
           # Webhook signature verification happens in-process (no API GW authorizer).
           SIGNING_PARAM_NAME: !Ref SigningParamName
-          # DynamoDB table backing durable webhook dedupe (Powertools Idempotency,
-          # keyed on the webhook event id). Replaces the old per-instance in-memory
-          # set so retried/concurrent deliveries launch exactly one MicroVM.
+          # DynamoDB table backing durable launch dedupe (Powertools Idempotency,
+          # keyed on the SESSION id with a short TTL): every agent turn fires
+          # another run_started webhook, and the live VM serves it instead of a
+          # new launch. See SESSION_DEDUPE_TTL_SECONDS in shared/constants.py.
           IDEMPOTENCY_TABLE: !Ref IdempotencyTable
       Policies:
         # Read only the signing-secret SSM SecureString, scoped to its ARN, plus
@@ -320,18 +331,22 @@ Resources:
             CloudWatchMetricsEnabled: true
             MetricName: !Sub "${ProjectName}-webhook-ip-reputation"
 
-        # Per-IP rate limit on the webhook path. 100 requests / 5 min per IP is
-        # the WAFv2 minimum and far above this endpoint's real volume (the webhook
-        # fires roughly once per session start). BLOCK directly — it's our own
-        # threshold, not a managed-rule false-positive risk. The signature check
-        # still authenticates; this just caps flooding.
+        # Per-IP rate limit on the webhook path. The webhook fires once per
+        # AGENT TURN (not per session), and Anthropic delivers from a small
+        # shared egress-IP pool, so the limit must absorb aggregate turn volume
+        # across all concurrent sessions — sustained 403s here would trip
+        # Anthropic's ~20-consecutive-failure auto-disable of the endpoint.
+        # 1000 requests / 5 min per IP covers bursty multi-session traffic while
+        # still capping floods. BLOCK directly — it's our own threshold, not a
+        # managed-rule false-positive risk. The signature check still
+        # authenticates; this just caps flooding.
         - Name: RateLimitWebhookPerIP
           Priority: 5
           Action:
             Block: {}
           Statement:
             RateBasedStatement:
-              Limit: 100
+              Limit: 1000
               EvaluationWindowSec: 300
               AggregateKeyType: IP
               ScopeDownStatement:
@@ -376,12 +391,13 @@ Resources:
       WebACLArn: !GetAtt WebhookWebACL.Arn
 
   # --- Idempotency store ---------------------------------------------------
-  # Durable dedupe for webhook deliveries (Powertools Idempotency). Anthropic
-  # retries the same event id on ANY non-2xx (and ~20 consecutive failures
-  # auto-disable the endpoint), and deliveries can arrive concurrently — a
-  # per-instance in-memory set missed both, double-launching MicroVMs. This
-  # table makes "exactly one MicroVM per webhook event" durable across cold
-  # starts and concurrent instances.
+  # Durable launch dedupe (Powertools Idempotency), keyed on SESSION id with a
+  # short TTL (SESSION_DEDUPE_TTL_SECONDS): every agent turn emits another
+  # run_started webhook, so per-event dedupe would launch one VM per turn.
+  # Anthropic retries on ANY non-2xx (and ~20 consecutive failures auto-disable
+  # the endpoint), and deliveries can arrive concurrently — this table makes
+  # "one MicroVM per session within the TTL" durable across cold starts and
+  # concurrent instances.
   #
   # Powertools schema: partition key `id` (string), item TTL on `expiration`.
   # PAY_PER_REQUEST suits the very low, bursty webhook volume (no capacity to
@@ -497,9 +513,14 @@ Resources:
             Statement:
               # The in-VM worker calls TerminateMicrovm on itself when the
               # session finishes to release compute immediately (the idle policy
-              # is the fallback). Action name per the Lambda MicroVMs IAM
-              # reference. MicroVM ids are assigned at run time, so the resource
-              # can't be scoped ahead of time.
+              # is the fallback). MicroVM ids are assigned at run time, so the
+              # resource can't be scoped to "self" ahead of time. Trade-off:
+              # agent code runs in the VM with this role's credentials, so a
+              # malicious prompt could terminate ANOTHER MicroVM in this
+              # account/region if it learns that VM's id (no List* is granted,
+              # so ids can't be enumerated) — availability-only blast radius,
+              # bounded to this stack's own sandboxes. Scope this down if the
+              # service adds a self-referencing condition key.
               - Effect: Allow
                 Action: "lambda:TerminateMicrovm"
                 Resource: "*"
@@ -590,7 +611,7 @@ Outputs:
     Description: Build role ARN passed to create-microvm-image.
     Value: !GetAtt BuildRole.Arn
   MicroVmExecutionRoleArn:
-    Description: Execution role the MicroVM assumes; SigV4-signs Claude Platform on AWS requests.
+    Description: Execution role the MicroVM assumes (reads the environment key in first-party mode; SigV4-signs Claude Platform on AWS requests in AWS mode).
     Value: !GetAtt MicroVmExecutionRole.Arn
   SigningParamName:
     Description: Create this SSM SecureString parameter with the Anthropic webhook signing secret.
