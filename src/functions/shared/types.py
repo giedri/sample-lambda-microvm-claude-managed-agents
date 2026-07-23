@@ -43,6 +43,9 @@ class WebhookEvent:
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "WebhookEvent":
+        # The envelope's top-level "type" is always the literal "event"; the
+        # event kind (e.g. "session.status_run_started") and session id live
+        # under "data" — the launcher must gate on data["type"].
         data = payload.get("data", {}) or {}
         return cls(
             event_id=payload.get("id", ""),
