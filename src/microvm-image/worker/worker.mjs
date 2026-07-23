@@ -42,11 +42,32 @@ const HOOK_PORT = Number(process.env.HOOK_PORT || 9000);
 const HOOK_HOST = "0.0.0.0";
 const HOOK_PREFIX = "/aws/lambda-microvms/runtime/v1";
 
-// Debug mode: WORKER_DEBUG=1 logs every tool call the agent executes in this VM
-// (tool name + input, e.g. the exact bash command) and a result preview to
-// CloudWatch. Off by default — tool inputs/outputs may contain sensitive data.
+// Debug mode: WORKER_DEBUG=1 logs everything flowing into this VM — every
+// lifecycle-hook request and body, the parsed /run dispatch, each work-poll
+// cycle (items seen, filter decisions, empty drains, retries), and every tool
+// call the agent executes (name + input + result preview) — to CloudWatch. Off
+// by default: payloads and tool inputs/outputs may contain sensitive data.
 const WORKER_DEBUG = process.env.WORKER_DEBUG === "1";
 const DEBUG_RESULT_PREVIEW_CHARS = 400;
+
+// Structured debug line. No-op unless WORKER_DEBUG=1. `data` is JSON-stringified
+// with a size cap so a huge payload can't blow up a log event.
+function dbg(event, data) {
+  if (!WORKER_DEBUG) return;
+  if (data === undefined) {
+    console.log(`worker[debug]: ${event}`);
+    return;
+  }
+  let rendered;
+  try {
+    rendered = typeof data === "string" ? data : JSON.stringify(data);
+  } catch (err) {
+    rendered = `<unserializable: ${err?.message || err}>`;
+  }
+  const MAX = 4000;
+  if (rendered.length > MAX) rendered = `${rendered.slice(0, MAX)}…(+${rendered.length - MAX} chars)`;
+  console.log(`worker[debug]: ${event} ${rendered}`);
+}
 
 // Wrap each runnable tool so its invocations are logged before/after execution.
 function withDebugLogging(tools) {
@@ -179,9 +200,20 @@ async function handleSession(dispatch) {
   if (WORKER_DEBUG) console.log("worker: debug mode ON — logging all tool calls");
 
   console.log(`worker: serving session ${sessionId}`);
+  dbg("serve.config", {
+    sessionId,
+    environmentId,
+    workIdleExitMs: WORK_IDLE_EXIT_MS,
+    workWaitRetryMs: WORK_WAIT_RETRY_MS,
+  });
   let handled = 0;
+  let pollCycle = 0;
   let idleDeadline = Date.now() + WORK_IDLE_EXIT_MS;
   do {
+    pollCycle += 1;
+    let seen = 0;
+    let matched = 0;
+    dbg("poll.begin", { cycle: pollCycle, msToDeadline: idleDeadline - Date.now() });
     const poller = new WorkPoller({
       client,
       environmentId,
@@ -191,22 +223,43 @@ async function handleSession(dispatch) {
       autoStop: false,
     });
 
-    for await (const work of poller) {
-      if (work.data.type !== "session" || work.data.id !== sessionId) {
-        continue;
+    try {
+      for await (const work of poller) {
+        seen += 1;
+        // Log every item the poller yields, matching or not — this is how we
+        // tell "empty queue" apart from "item present but filtered out".
+        dbg("poll.item", {
+          cycle: pollCycle,
+          workId: work.id,
+          dataType: work.data?.type,
+          dataId: work.data?.id,
+          matchesSession: work.data?.type === "session" && work.data?.id === sessionId,
+        });
+        if (work.data.type !== "session" || work.data.id !== sessionId) {
+          dbg("poll.skip", { cycle: pollCycle, workId: work.id, reason: work.data?.type !== "session" ? "type" : "sessionId" });
+          continue;
+        }
+        matched += 1;
+        console.log(`worker: handling session ${sessionId} (work ${work.id})`);
+        await worker.handleItem({ workId: work.id, environmentId, sessionId, environmentKey });
+        handled += 1;
+        console.log(`worker: session ${sessionId} turn complete (${handled} handled); waiting for next turn`);
+        idleDeadline = Date.now() + WORK_IDLE_EXIT_MS;
       }
-      console.log(`worker: handling session ${sessionId} (work ${work.id})`);
-      await worker.handleItem({ workId: work.id, environmentId, sessionId, environmentKey });
-      handled += 1;
-      console.log(`worker: session ${sessionId} turn complete (${handled} handled); waiting for next turn`);
-      idleDeadline = Date.now() + WORK_IDLE_EXIT_MS;
+    } catch (err) {
+      // A throw inside the async iterator (poll/ack HTTP error, auth failure,
+      // abort) would otherwise be invisible — it just ends the for-await. Log
+      // it and let the retry loop try again until the idle deadline.
+      dbg("poll.error", { cycle: pollCycle, message: err?.message || String(err), name: err?.name });
+      if (WORKER_DEBUG) console.error("worker[debug]: poll cycle threw:", err);
     }
+    dbg("poll.drained", { cycle: pollCycle, seen, matched, retryInMs: WORK_WAIT_RETRY_MS });
     // Queue drained without our item — not claimable yet, or the session is
     // between turns. Retry until the idle deadline.
     await new Promise((r) => setTimeout(r, WORK_WAIT_RETRY_MS));
   } while (Date.now() < idleDeadline);
   console.log(
-    `worker: session ${sessionId} idle for ${WORK_IDLE_EXIT_MS}ms after ${handled} turn(s); exiting`,
+    `worker: session ${sessionId} idle for ${WORK_IDLE_EXIT_MS}ms after ${handled} turn(s) over ${pollCycle} poll cycle(s); exiting`,
   );
 }
 
@@ -251,6 +304,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify(body));
   };
 
+  dbg("http.request", { method: req.method, url: req.url });
   if (req.method !== "POST" || !req.url.startsWith(HOOK_PREFIX)) {
     res.writeHead(404);
     res.end();
@@ -264,17 +318,32 @@ const server = http.createServer(async (req, res) => {
     case "resume":
     case "suspend":
     case "terminate":
+      // These hooks carry a body too (VM/session metadata); capture it so we
+      // can see everything the platform delivers to the VM, not just /run.
+      if (WORKER_DEBUG) {
+        const raw = await readBody(req);
+        dbg("hook.body", { hook, raw });
+      }
       ok();
       return;
     case "run": {
       try {
         const raw = await readBody(req);
+        dbg("run.raw", { raw });
         const envelope = raw ? JSON.parse(raw) : {};
         // The service wraps the payload: { microvmId, runHookPayload: "<JSON>" }.
         const inner = envelope.runHookPayload
           ? JSON.parse(envelope.runHookPayload)
           : envelope;
         const dispatch = inner.session || inner;
+        dbg("run.dispatch", {
+          microvmId: envelope.microvmId,
+          envelopeKeys: Object.keys(envelope),
+          dispatchKeys: Object.keys(dispatch),
+          sessionId: dispatch.ANTHROPIC_SESSION_ID,
+          environmentId: dispatch.ANTHROPIC_ENVIRONMENT_ID,
+          region: dispatch.AWS_REGION,
+        });
         if (!dispatch.ANTHROPIC_SESSION_ID) {
           console.error("worker: /run hook missing ANTHROPIC_SESSION_ID in payload:", raw);
           res.writeHead(400, { "content-type": "application/json" });
