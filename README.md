@@ -43,14 +43,18 @@ traffic is the webhook call; the rest of the workflow is pull-based. The flow:
    **webhook signature** in-process using the signing secret from SSM Parameter
    Store, denying invalid or stale deliveries.
 3. The launcher calls `RunMicrovm` to launch one MicroVM for that session,
-   passing the session dispatch via `runHookPayload`. It dedupes on the webhook
-   event id (DynamoDB-backed) and stays within the RunMicrovm rate limit.
+   passing the session dispatch via `runHookPayload`. It dedupes on the
+   **session id** (DynamoDB-backed, short TTL) so repeat `run_started` webhooks
+   for a session in progress don't launch another VM, and stays within the
+   RunMicrovm rate limit. See [Session lifecycle](#session-lifecycle-one-microvm-per-session-reused-across-turns).
 4. The MicroVM receives the dispatch on its `/run` hook: it fetches the
-   environment key from SSM Parameter Store using its own execution role, claims
-   the matching session from the Anthropic work queue, executes the agent's tool
-   calls in `/workspace`, posts results back to Anthropic, and then calls
-   `TerminateMicrovm` on itself to release compute immediately. The idle policy
-   is only the fallback if that call can't be made.
+   environment key from SSM Parameter Store using its own execution role, then
+   polls the Anthropic work queue, claiming only work items for **its own**
+   session (foreign items are left un-acked for the rightful VM to reclaim),
+   executes the agent's tool calls in `/workspace`, posts results back to
+   Anthropic, and — when the session goes idle — calls `TerminateMicrovm` on
+   itself to release compute. The idle policy is only the fallback if that call
+   can't be made.
 
 **Credential boundaries.** The organization-scoped API key is used only by the
 operator (registering the webhook, creating sessions) and never reaches AWS
@@ -95,7 +99,7 @@ key is never placed on any AWS compute.
 │   │   ├── shared/                  # Payload, rate limiter, MicroVM client, types
 │   │   └── wheels/                  # Vendored boto3/botocore wheels (lambda-microvms client)
 │   ├── scripts/
-│   │   ├── build-image.sh           # Zip + upload + create-microvm-image
+│   │   ├── build-image.sh           # Zip + upload + create/update microvm image
 │   │   ├── create-anthropic-access-role.sh  # Cross-account role for Claude Platform on AWS
 │   │   └── verify.py                # Operator-side: create a session + start a run
 ├── docs/                            # Architecture diagram + notes
@@ -176,10 +180,13 @@ key instead.
 ./src/scripts/build-image.sh
 ```
 
-The script zips `src/microvm-image/`, uploads to S3, and creates the image with
-lifecycle hooks enabled. Monitor the build in CloudWatch under
-`/aws/lambda/microvms/<image-name>`; the image transitions
-`IN_PROGRESS → SUCCESSFUL`.
+The script zips `src/microvm-image/` (excluding local-only artifacts like
+`node_modules/` — the Dockerfile runs its own `npm install`), uploads to S3,
+and **creates the image, or updates it in place if one with the same name
+already exists** (re-run it to ship worker changes). Monitor the build in
+CloudWatch under `/aws/lambda/microvms/<image-name>`; the image transitions to
+`CREATED` (or `UPDATED`) on success. Pass `WORKER_DEBUG=1` to bake in verbose
+logging — see [Worker debug mode](#worker-debug-mode).
 
 ### 4. Verify (operator-side)
 
@@ -303,11 +310,21 @@ minutes.
 
 ### Worker debug mode
 
-Set `WORKER_DEBUG=1` in the MicroVM image's environment variables
-(`update-microvm-image --environment-variables '{"WORKER_DEBUG":"1"}'`) to log
-every tool call the agent executes — tool name and full input (e.g. the exact
-bash command) plus a 400-character result preview — to the image's CloudWatch
-log group. Off by default: tool inputs/outputs may contain sensitive data.
+Set `WORKER_DEBUG=1` in the MicroVM image's environment variables to log, to
+the image's CloudWatch log group, everything flowing into the VM:
+
+- every lifecycle-hook request and body, plus the raw `/run` envelope and the
+  parsed dispatch (session/env/region);
+- each work-poll cycle — items seen, whether each matches this VM's session,
+  foreign items left for reclaim, empty drains, and poll/ack errors (this is
+  how the cross-session starvation bug below was diagnosed);
+- every tool call the agent executes — tool name and full input (e.g. the exact
+  bash command) plus a 400-character result preview.
+
+Enable it at build time with `WORKER_DEBUG=1 ./src/scripts/build-image.sh`, or
+directly via `update-microvm-image --environment-variables '{"WORKER_DEBUG":"1"}'`.
+Off by default: the logged payloads and tool inputs/outputs may contain
+sensitive data — turn it back off (rebuild without the variable) once done.
 `WORK_IDLE_EXIT_MS` can be tuned the same way.
 
 The MicroVM image installs **Node.js 22** (`nodejs22` on AL2023) — the
@@ -324,6 +341,7 @@ build if an older version ends up on `PATH`.
 | Launcher `KeyError` on an env var (e.g. `ANTHROPIC_ENVIRONMENT_ID`) | The function's environment was changed out-of-band (e.g. `update-function-configuration`), causing CloudFormation drift the template can't self-heal. Redeploy with a changed `Environment` block (bump `CACHE_BUST`) to force CFN to rewrite it, and keep all env changes in the template. |
 | One VM launched per agent turn | The launcher dedupes on **session id** for `SESSION_DEDUPE_TTL_SECONDS`; if you see per-turn launches, confirm the idempotency table is configured (`IDEMPOTENCY_TABLE`) and the worker's `WORK_IDLE_EXIT_MS` exceeds the dedupe TTL. |
 | Second run of a session hangs in the Console | The worker must outlive the dedupe window and keep polling (`WORK_IDLE_EXIT_MS`). On older images the worker exited after one drain pass, so a turn arriving later found no worker; rebuild the image. A session stuck `waiting on responses` from a dead VM needs a `user.interrupt` before it accepts new messages. |
+| Session hangs with the VM alive but idle (worker logs poll cycles finding no work while another session runs) | Cross-session work-item theft: a VM must claim (`ack`) only its own session's items and leave foreign items un-acked for the rightful VM to reclaim. A worker that claims-then-skips a foreign item strands it and starves the other session. Fixed in current images (raw poll + selective ack); rebuild if you see this. `WORKER_DEBUG=1` shows `poll.foreign` / `poll.item` lines that confirm it. |
 | Image build fails `S3_*` | Build role/bucket issue. Confirm the artifact is in the same region, not in Glacier, and the Build role grants `s3:GetObject`. |
 | Image build fails `ARCHIVE_DOCKERFILE_NOT_FOUND` | Dockerfile must be at the root of `app.zip`; `build-image.sh` zips from inside `microvm-image/`. |
 | Worker 401 `Invalid bearer token` (AWS mode) | The worker sent a bearer credential to the AWS gateway — environment keys don't work there. Deploy with `AnthropicAwsWorkspaceId` (not `EnvironmentKeyParamName`) and rebuild the image. |
