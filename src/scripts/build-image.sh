@@ -30,6 +30,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 IMAGE_SRC="${REPO_ROOT}/microvm-image"
 
+# ${ARR[@]+"${ARR[@]}"} expansions below: empty-array-safe under `set -u` on
+# bash 3.2 (macOS default), which treats "${ARR[@]}" of an empty array as unbound.
 REGION_ARG=()
 if [[ -n "${AWS_REGION:-}" ]]; then
   REGION_ARG=(--region "${AWS_REGION}")
@@ -38,10 +40,10 @@ fi
 echo "Resolving artifact bucket and build role from stack '${STACK_NAME}'..."
 BUCKET="$(aws cloudformation describe-stacks --stack-name "${STACK_NAME}" \
   --query "Stacks[0].Outputs[?OutputKey=='ArtifactBucketName'].OutputValue" \
-  --output text "${REGION_ARG[@]}")"
+  --output text ${REGION_ARG[@]+"${REGION_ARG[@]}"})"
 BUILD_ROLE_ARN="$(aws cloudformation describe-stacks --stack-name "${STACK_NAME}" \
   --query "Stacks[0].Outputs[?OutputKey=='BuildRoleArn'].OutputValue" \
-  --output text "${REGION_ARG[@]}")"
+  --output text ${REGION_ARG[@]+"${REGION_ARG[@]}"})"
 
 if [[ -z "${BUCKET}" || "${BUCKET}" == "None" ]]; then
   echo "Could not resolve ArtifactBucketName from stack '${STACK_NAME}'." >&2
@@ -52,7 +54,7 @@ fi
 if [[ -z "${BASE_IMAGE_ARN:-}" ]]; then
   echo "Discovering a managed base image via list-managed-microvm-images..."
   BASE_IMAGE_ARN="$(aws lambda-microvms list-managed-microvm-images \
-    --query "items[0].imageArn" --output text "${REGION_ARG[@]}")"
+    --query "items[0].imageArn" --output text ${REGION_ARG[@]+"${REGION_ARG[@]}"})"
   if [[ -z "${BASE_IMAGE_ARN}" || "${BASE_IMAGE_ARN}" == "None" ]]; then
     echo "Could not discover a managed base image. Set BASE_IMAGE_ARN explicitly." >&2
     exit 1
@@ -76,7 +78,7 @@ echo "Packaging ${IMAGE_SRC} -> ${TMP_ZIP}..."
 
 # 2. Upload to S3.
 echo "Uploading to s3://${BUCKET}/${S3_KEY}..."
-aws s3 cp "${TMP_ZIP}" "s3://${BUCKET}/${S3_KEY}" "${REGION_ARG[@]}"
+aws s3 cp "${TMP_ZIP}" "s3://${BUCKET}/${S3_KEY}" ${REGION_ARG[@]+"${REGION_ARG[@]}"}
 
 # Shared image spec (same hooks for create and update).
 HOOKS='{"port":9000,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":300,"validate":"ENABLED","validateTimeoutInSeconds":300},"microvmHooks":{"run":"ENABLED","runTimeoutInSeconds":5,"resume":"ENABLED","resumeTimeoutInSeconds":5,"suspend":"ENABLED","suspendTimeoutInSeconds":5,"terminate":"ENABLED","terminateTimeoutInSeconds":5}}'
@@ -92,7 +94,7 @@ fi
 # create-microvm-image rejects a duplicate name, so check first and branch.
 EXISTING_ARN="$(aws lambda-microvms get-microvm-image \
   --image-identifier "${IMAGE_NAME}" \
-  --query "imageArn" --output text "${REGION_ARG[@]}" 2>/dev/null || true)"
+  --query "imageArn" --output text ${REGION_ARG[@]+"${REGION_ARG[@]}"} 2>/dev/null || true)"
 
 if [[ -n "${EXISTING_ARN}" && "${EXISTING_ARN}" != "None" ]]; then
   echo "Image '${IMAGE_NAME}' exists (${EXISTING_ARN}); updating in place..."
@@ -102,8 +104,8 @@ if [[ -n "${EXISTING_ARN}" && "${EXISTING_ARN}" != "None" ]]; then
     --base-image-arn "${BASE_IMAGE_ARN}" \
     --build-role-arn "${BUILD_ROLE_ARN}" \
     --hooks "${HOOKS}" \
-    "${ENV_ARG[@]}" \
-    "${REGION_ARG[@]}"
+    ${ENV_ARG[@]+"${ENV_ARG[@]}"} \
+    ${REGION_ARG[@]+"${REGION_ARG[@]}"}
 else
   echo "Creating MicroVM image '${IMAGE_NAME}'..."
   aws lambda-microvms create-microvm-image \
@@ -112,8 +114,8 @@ else
     --base-image-arn "${BASE_IMAGE_ARN}" \
     --build-role-arn "${BUILD_ROLE_ARN}" \
     --hooks "${HOOKS}" \
-    "${ENV_ARG[@]}" \
-    "${REGION_ARG[@]}"
+    ${ENV_ARG[@]+"${ENV_ARG[@]}"} \
+    ${REGION_ARG[@]+"${REGION_ARG[@]}"}
 fi
 
 echo

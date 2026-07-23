@@ -3,14 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "In-MicroVM Anthropic EnvironmentWorker for the Claude self-hosted sandbox sample (Claude Platform on AWS, SigV4 auth).",
+  "description": "In-MicroVM Anthropic EnvironmentWorker for the Claude self-hosted sandbox sample (first-party environment-key or Claude Platform on AWS SigV4 auth).",
   "engines": {
     "node": ">=22"
   },
   "dependencies": {
     "@anthropic-ai/aws-sdk": "^0.6.1",
     "@anthropic-ai/sdk": "^0.112.4",
-    "@aws-sdk/client-lambda-microvms": "^3.600.0",
+    "@aws-sdk/client-lambda-microvms": "^3.1074.0",
     "@aws-sdk/client-ssm": "^3.600.0",
     "@aws-sdk/credential-providers": "^3.796.0"
   }
